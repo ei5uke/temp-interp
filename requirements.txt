@@ -7,3 +7,5 @@ gymnasium[box2d]
 scikit-learn
 stable-baselines3[extra]
 wandb
+ipdb # optional, for debugging only.
+# flow @ git+https://github.com/flow-project/flow.git
