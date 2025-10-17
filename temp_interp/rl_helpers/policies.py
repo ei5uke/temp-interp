@@ -96,6 +96,7 @@ class ICCTPolicy(BasePolicy):
         self.action_space = action_space
         self.action_dim = get_action_dim(self.action_space)
         self.ddt_kwargs = ddt_kwargs
+        self.rpo_alpha = 0.5 # Robust Policy Optimization addition
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
@@ -310,6 +311,9 @@ class ICCTPolicy(BasePolicy):
         :return: Action distribution
         """
         mean_actions = self.action_net(latent_pi)
+        # new to RPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py
+        z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
+        mean_actions = mean_actions + z
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
 
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
