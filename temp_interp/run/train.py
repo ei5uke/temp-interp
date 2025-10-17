@@ -7,12 +7,13 @@ import copy
 import argparse
 import random
 import os
-import torch
+import torch as th
 from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from stable_baselines3.common.torch_layers import (
     CombinedExtractor,
     FlattenExtractor
 )
+from typing import Callable
 
 from temp_interp.rl_helpers.ppo import PPO
 #### might have issues b/c hpc isn't ubuntu, figure out later
@@ -24,11 +25,14 @@ from temp_interp.rl_helpers.ppo import PPO
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
 
-def make_env(env_name, seed):
-    set_random_seed(seed)
+def make_env(env_name, seed, gamma):
+    set_random_seed(seed) # can add: using_cuda=True
     if env_name == 'lunar':
         env = gym.make('LunarLanderContinuous-v3')
         name = 'LunarLanderContinuous-v3'
+        ### CleanRL
+        env = gym.wrappers.NormalizeObservation(env)
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
     elif env_name == 'cart':
         env = gym.make('InvertedPendulum-v2')
         name = 'InvertedPendulum-v2'
@@ -52,11 +56,29 @@ def make_env(env_name, seed):
     env.reset(seed=seed)
     return env, name
 
+# https://stable-baselines3.readthedocs.io/en/master/guide/examples.html
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    """
+    Linear learning rate schedule.
+
+    :param initial_value: Initial learning rate.
+    :return: schedule that computes
+      current learning rate depending on remaining progress
+    """
+    def func(progress_remaining: float) -> float:
+        """
+        Progress will decrease from 1 (beginning) to 0.
+
+        :param progress_remaining:
+        :return: current learning rate
+        """
+        return progress_remaining * initial_value
+    return func
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ICCT Training')
     parser.add_argument('--env_name', help='environment to run on', type=str, default='lunar')
-    parser.add_argument('--alg_type', help='(formerly) sac or td3', type=str, default='ppo')
+    parser.add_argument('--alg_type', help='only ppo for now', type=str, default='ppo')
     parser.add_argument('--policy_type', help='mlp or ddt', type=str, default='ddt')
     parser.add_argument('--mlp_size', help='the size of mlp (small|medium|large)', type=str, default='medium')
     parser.add_argument('--seed', help='the seed number to use', type=int, default=42)
@@ -68,6 +90,9 @@ if __name__ == "__main__":
     parser.add_argument('--lr', help='learning rate', type=float, default=3e-4)
     parser.add_argument('--batch_size', help='batch size', type=int, default=256)
     parser.add_argument('--gamma', help='the discount factor', type=float, default=0.9999)
+    parser.add_argument('--clip-range', help='the clip coef of the gradient update', type=float, default=0.2)
+    parser.add_argument('--clip-range-vf', help='the clip range of the value function', type=float, default=300)
+    parser.add_argument('--ent-coef', help='the entropy coefficient in PPO', type=float, default=0.1)
     parser.add_argument('--learning_starts', help='how many steps of the model to collect transitions for before learning starts', type=int, default=10000)
     parser.add_argument('--training_steps', help='total steps for training the model', type=int, default=500000)
     parser.add_argument('--argmax_tau', help='the temperature of the diff_argmax function', type=float, default=1.0)
@@ -87,40 +112,30 @@ if __name__ == "__main__":
 
     
     args = parser.parse_args()
-    env, env_n = make_env(args.env_name, args.seed)
+    env, env_n = make_env(args.env_name, args.seed, args.gamma)
     eval_env = gym.make(env_n)
+    eval_env = gym.wrappers.NormalizeObservation(eval_env)
+    # eval_env = gym.wrappers.NormalizeReward(eval_env, gamma=args.gamma) # don't normalize reward for evaluating env
     eval_env.reset(seed=args.seed)
     log_dir = args.save_path
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
-    if args.policy_type == 'ddt':
-        if not args.submodels and not args.hard_node:
-            method = 'm1'
-        elif args.submodels and not args.hard_node:
-            method = 'm2'
-            if args.sparse_submodel_type == 1 or args.sparse_submodel_type == 2:
-                raise Exception('Not a method we want to test')
-        elif not args.submodels and args.hard_node:
-            method = 'm3'    
-        else:
-            if args.sparse_submodel_type != 1 and args.sparse_submodel_type != 2:
-                method = 'm4'
-            elif args.sparse_submodel_type == 1:
-                method = 'm5a'
-            else:
-                method = f'm5b_{args.num_sub_features}'
-    elif args.policy_type == 'mlp':
-        if args.mlp_size == 'small':
-            method = 'mlp_s'
-        elif args.mlp_size == 'medium':
-            method = 'mlp_m'
-        elif args.mlp_size == 'large':
-            method = 'mlp_l'
-        else:
-            raise Exception('Not a valid MLP size')
+    if not args.submodels and not args.hard_node:
+        method = 'm1'
+    elif args.submodels and not args.hard_node:
+        method = 'm2'
+        if args.sparse_submodel_type == 1 or args.sparse_submodel_type == 2:
+            raise Exception('Not a method we want to test')
+    elif not args.submodels and args.hard_node:
+        method = 'm3'    
     else:
-        raise Exception('Not a valid policy type')
+        if args.sparse_submodel_type != 1 and args.sparse_submodel_type != 2:
+            method = 'm4'
+        elif args.sparse_submodel_type == 1:
+            method = 'm5a'
+        else:
+            method = f'm5b_{args.num_sub_features}'
     
     monitor_file_path = log_dir + method + f'_seed{args.seed}'
     env = Monitor(env, monitor_file_path)
@@ -147,87 +162,37 @@ if __name__ == "__main__":
     if args.alg_type != 'ppo':
         raise Exception('Not a valid RL algorithm type')
 
-    if args.policy_type == 'ddt':
-        ddt_kwargs = {
-            'num_leaves': args.num_leaves,
-            'submodels': args.submodels,
-            'hard_node': args.hard_node,
-            'device': args.device,
-            'argmax_tau': args.argmax_tau,
-            'ddt_lr': args.ddt_lr,
-            'use_individual_alpha': args.use_individual_alpha,
-            'sparse_submodel_type': args.sparse_submodel_type,
-            'fs_submodel_version': args.fs_submodel_version,
-            'l1_reg_coeff': args.l1_reg_coeff,
-            'l1_reg_bias': args.l1_reg_bias,
-            'l1_hard_attn': args.l1_hard_attn,
-            'num_sub_features': args.num_sub_features,
-            'use_gumbel_softmax': args.use_gumbel_softmax,
-            'alg_type': args.alg_type
-        }
-        policy_kwargs = {
-            'features_extractor_class': features_extractor,
-            'ddt_kwargs': ddt_kwargs
-        }
-        policy_name = 'ICCTPolicy'
-        policy_kwargs['net_arch'] = {'pi': [16, 16], 'qf': [400, 300]} # [400, 300] is a default setting in SB3 for TD3
-
-    elif args.policy_type == 'mlp':
-        if args.env_name == 'lane_keeping':
-            policy_name = 'MultiInputPolicy'
-        else:
-            policy_name = 'MlpPolicy'
-            
-        if args.mlp_size == 'small':
-            if args.env_name == 'cart':
-                pi_size = [6, 6]
-            elif args.env_name == 'lunar':
-                pi_size = [6, 6]
-            elif args.env_name == 'lane_keeping':
-                pi_size = [6, 6]
-            elif args.env_name == 'ring_accel':
-                pi_size = [3, 3]
-            elif args.env_name == 'ring_lane_changing':
-                pi_size = [3, 3] 
-            else:
-                pi_size = [3, 3] 
-        elif args.mlp_size == 'medium':
-            if args.env_name == 'cart':
-                pi_size = [8, 8]
-            elif args.env_name == 'lunar': 
-                pi_size = [10, 10]
-            elif args.env_name == 'lane_keeping':
-                pi_size = [14, 14]
-            elif args.env_name == 'ring_accel':
-                pi_size = [12, 12]
-            elif args.env_name == 'ring_lane_changing':
-                pi_size = [32, 32] 
-            else:
-                pi_size = [20, 20] 
-        elif args.mlp_size == 'large':
-            if args.alg_type == 'sac':
-                pi_size = [256, 256]
-            else:
-                pi_size = [400, 300]
-        else:
-            raise Exception('Not a valid MLP size')
-        if args.alg_type == 'sac':
-            policy_kwargs = {
-                'net_arch': {'pi': pi_size, 'qf': [256, 256]},
-                'features_extractor_class': features_extractor,
-            }
-        else:
-            policy_kwargs = {
-                'net_arch': {'pi': pi_size, 'qf': [400, 300]},
-                'features_extractor_class': features_extractor,
-            }
-    else:
-        raise Exception('Not a valid policy type')
+    ddt_kwargs = {
+        'num_leaves': args.num_leaves,
+        'submodels': args.submodels,
+        'hard_node': args.hard_node,
+        'device': args.device,
+        'argmax_tau': args.argmax_tau,
+        'ddt_lr': args.ddt_lr,
+        'use_individual_alpha': args.use_individual_alpha,
+        'sparse_submodel_type': args.sparse_submodel_type,
+        'fs_submodel_version': args.fs_submodel_version,
+        'l1_reg_coeff': args.l1_reg_coeff,
+        'l1_reg_bias': args.l1_reg_bias,
+        'l1_hard_attn': args.l1_hard_attn,
+        'num_sub_features': args.num_sub_features,
+        'use_gumbel_softmax': args.use_gumbel_softmax,
+        'alg_type': args.alg_type
+    }
+    policy_kwargs = {
+        'features_extractor_class': features_extractor,
+        'ddt_kwargs': ddt_kwargs,
+        'net_arch': {'vf': [64, 64]}, # ICCT uses a qf with [256, 256]; there should be no pi or else a feature_extractor will be made
+        'activation_fn': th.nn.Tanh, # can also test around with th.nn.ReLU
+    }
+    policy_name = 'ICCTPolicy'
 
     model = PPO(policy_name, env,
-                learning_rate=args.lr,
+                learning_rate=linear_schedule(args.lr),
                 batch_size=args.batch_size,
-                ent_coef='auto',
+                ent_coef=args.ent_coef,
+                clip_range=args.clip_range,
+                clip_range_vf=args.clip_range_vf,
                 gamma=args.gamma,
                 policy_kwargs=policy_kwargs,
                 tensorboard_log=log_dir,
