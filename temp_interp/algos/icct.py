@@ -112,7 +112,7 @@ class ICCT(nn.Module):
             for level in range(depth):
                 for node in range(2**level):
                     comparators.append(np.random.normal(0, 1.0, 1))
-        new_comps = torch.tensor(comparators, dtype=torch.float).to(self.device)
+        new_comps = torch.tensor(np.array(comparators), dtype=torch.float).to(self.device)
         new_comps.requires_grad = True
         self.comparators = nn.Parameter(new_comps, requires_grad=True)
 
@@ -127,7 +127,7 @@ class ICCT(nn.Module):
                 for node in range(2**level):
                     weights.append(np.random.rand(self.input_dim))
 
-        new_weights = torch.tensor(weights, dtype=torch.float).to(self.device)
+        new_weights = torch.tensor(np.array(weights), dtype=torch.float).to(self.device)
         new_weights.requires_grad = True
         self.layers = nn.Parameter(new_weights, requires_grad=True)
 
@@ -224,7 +224,7 @@ class ICCT(nn.Module):
                 self.leaf_init_information.append([sorted(left_path), sorted(right_path), new_probs])
                 new_leaves.append(new_probs)
 
-        labels = torch.tensor(new_leaves, dtype=torch.float).to(self.device)
+        labels = torch.tensor(np.array(new_leaves), dtype=torch.float).to(self.device)
         labels.requires_grad = True
         if not self.use_submodels:
             self.action_mus = nn.Parameter(labels, requires_grad=True)
