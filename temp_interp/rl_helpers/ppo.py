@@ -94,7 +94,7 @@ class PPO(OnPolicyAlgorithm):
         clip_range: Union[float, Schedule] = 0.2,
         clip_range_vf: Union[None, float, Schedule] = None,
         normalize_advantage: bool = True,
-        ent_coef: float = 0.0, # when this is 0, self.ent_coef = "auto" for some reason
+        ent_coef: float = 0.0,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
@@ -218,9 +218,8 @@ class PPO(OnPolicyAlgorithm):
                 values = values.flatten()
 
                 # DDT addition
-                if hasattr(self.policy, 'ddt'):
-                    if self.policy.ddt.use_submodels and self.policy.ddt.sparse_submodel_type == 1:
-                        attn = self.policy.ddt.leaf_attn.repeat_interleave(2)
+                if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
+                    attn = self.policy.action_net.leaf_attn.repeat_interleave(2)
 
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -237,19 +236,18 @@ class PPO(OnPolicyAlgorithm):
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
 
                 # DDT addition
-                if hasattr(self.policy, 'ddt'):
-                    if self.policy.ddt.use_submodels and self.policy.ddt.sparse_submodel_type == 1:
-                        l1_reg_loss = 0
-                        if self.policy.ddt_kwargs['l1_reg_bias']:
-                            for i, (name, p) in enumerate(self.policy.ddt.lin_models.named_parameters()):
+                if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
+                    l1_reg_loss = 0
+                    if self.policy.action_net_kwargs['l1_reg_bias']:
+                        for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
+                            l1_reg_loss += th.sum(abs(p)) * attn[i]
+                    else:
+                        for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
+                            if not 'bias' in name:
                                 l1_reg_loss += th.sum(abs(p)) * attn[i]
-                        else:
-                            for i, (name, p) in enumerate(self.policy.ddt.lin_models.named_parameters()):
-                                if not 'bias' in name:
-                                    l1_reg_loss += th.sum(abs(p)) * attn[i]
-                        l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
-                        l1_reg_losses.append(l1_reg_loss.item())
-                        policy_loss += l1_reg_loss
+                    l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
+                    l1_reg_losses.append(l1_reg_loss.item())
+                    policy_loss += l1_reg_loss
 
                 # Logging
                 pg_losses.append(policy_loss.item())
@@ -278,8 +276,7 @@ class PPO(OnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
-                # loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                loss = policy_loss  + 0.1 * entropy_loss + self.vf_coef * value_loss # some bug exists with self.ent_coef
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -334,6 +331,8 @@ class PPO(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfPPO:
+        # print(self.policy)
+        # exit()
         return super().learn(
             total_timesteps=total_timesteps,
             callback=callback,
