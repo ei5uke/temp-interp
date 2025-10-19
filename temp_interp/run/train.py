@@ -24,37 +24,15 @@ from temp_interp.rl_helpers.ppo import PPO
 ####
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.env_util import make_vec_env
 
-def make_env(env_name, seed, gamma):
-    set_random_seed(seed) # can add: using_cuda=True
-    if env_name == 'lunar':
-        env = gym.make('LunarLanderContinuous-v3')
-        name = 'LunarLanderContinuous-v3'
-        ### CleanRL
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-    elif env_name == 'cart':
-        env = gym.make('InvertedPendulum-v2')
-        name = 'InvertedPendulum-v2'
-    elif env_name == 'lane_keeping':
-        env = gym.make('lane-keeping-v0')
-        name = 'lane-keeping-v0'
-    # elif env_name == 'ring_accel':
-    #     create_env, gym_name = make_create_env(params=ring_accel_params, version=0)
-    #     env = create_env()  
-    #     name = gym_name
-    # elif env_name == 'ring_lane_changing':
-    #     create_env, gym_name = make_create_env(params=ring_accel_lc_params, version=0)
-    #     env = create_env()  
-    #     name = gym_name    
-    # elif env_name == 'figure8':
-    #     create_env, gym_name = make_create_env(params=fig8_params, version=0)
-    #     env = create_env()  
-    #     name = gym_name 
-    else:
-        raise Exception('No valid environment selected')
-    env.reset(seed=seed)
-    return env, name
+def make_env(env_name, gamma):
+    def thunk():
+        env = gym.make(env_id)
+        # env = gym.wrappers.NormalizeObservation(env)
+        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        return env
+    return thunk
 
 # https://stable-baselines3.readthedocs.io/en/master/guide/examples.html
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -78,6 +56,7 @@ def linear_schedule(initial_value: float) -> Callable[[float], float]:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ICCT Training')
     parser.add_argument('--env_name', help='environment to run on', type=str, default='lunar')
+    parser.add_argument('--num_envs', help='Number of parallel environments to run', type=int, default=1)
     parser.add_argument('--alg_type', help='only ppo for now', type=str, default='ppo')
     parser.add_argument('--policy_type', help='mlp or ddt', type=str, default='ddt')
     parser.add_argument('--mlp_size', help='the size of mlp (small|medium|large)', type=str, default='medium')
@@ -87,13 +66,13 @@ if __name__ == "__main__":
     parser.add_argument('--sparse_submodel_type', help='the type of the sparse submodel, 1 for L1 regularization, 2 for feature selection, other values for not sparse', type=int, default=0)
     parser.add_argument('--hard_node', help='if use differentiable crispification', action='store_true', default=False)
     parser.add_argument('--gpu', help='if run on a GPU', action='store_true', default=False)
+    parser.add_argument('--n_steps', help='Number of steps per batch', type=int, default=2048)
     parser.add_argument('--lr', help='learning rate', type=float, default=3e-4)
     parser.add_argument('--batch_size', help='batch size', type=int, default=256)
     parser.add_argument('--gamma', help='the discount factor', type=float, default=0.9999)
     parser.add_argument('--clip-range', help='the clip coef of the gradient update', type=float, default=0.2)
-    parser.add_argument('--clip-range-vf', help='the clip range of the value function', type=float, default=300)
+    parser.add_argument('--clip-range-vf', help='the clip range of the value function, must be tuned depending on the env rewards', type=float, default=None)
     parser.add_argument('--ent-coef', help='the entropy coefficient in PPO', type=float, default=0.1)
-    parser.add_argument('--learning_starts', help='how many steps of the model to collect transitions for before learning starts', type=int, default=10000)
     parser.add_argument('--training_steps', help='total steps for training the model', type=int, default=500000)
     parser.add_argument('--argmax_tau', help='the temperature of the diff_argmax function', type=float, default=1.0)
     parser.add_argument('--ddt_lr', help='the learning rate of the ddt', type=float, default=3e-4)
@@ -112,9 +91,14 @@ if __name__ == "__main__":
 
     
     args = parser.parse_args()
-    env, env_n = make_env(args.env_name, args.seed, args.gamma)
-    eval_env = gym.make(env_n)
-    eval_env = gym.wrappers.NormalizeObservation(eval_env)
+    set_random_seed(args.seed) # can add: using_cuda=True
+    if args.env_name == 'lunar': env_id = 'LunarLanderContinuous-v3'
+    elif args.env_name == 'cart': env_id = 'InvertedPendulum-v5' # update to v5 for compatibility
+    envs = make_vec_env(make_env(env_id, args.gamma), n_envs=args.num_envs)
+    envs.seed(seed=args.seed)
+
+    eval_env = gym.make(env_id)
+    # eval_env = gym.wrappers.NormalizeObservation(eval_env)
     # eval_env = gym.wrappers.NormalizeReward(eval_env, gamma=args.gamma) # don't normalize reward for evaluating env
     eval_env.reset(seed=args.seed)
     log_dir = args.save_path
@@ -137,8 +121,8 @@ if __name__ == "__main__":
         else:
             method = f'm5b_{args.num_sub_features}'
     
-    monitor_file_path = log_dir + method + f'_seed{args.seed}'
-    env = Monitor(env, monitor_file_path)
+    # monitor_file_path = log_dir + method + f'_seed{args.seed}'
+    # envs = Monitor(envs, monitor_file_path)
     eval_monitor_file_path = log_dir + 'eval_' + method + f'_seed{args.seed}'
     eval_env = Monitor(eval_env, eval_monitor_file_path)
     callback = EpCheckPointCallback(eval_env=eval_env, best_model_save_path=log_dir, n_eval_episodes=args.n_eval_episodes,
@@ -187,8 +171,9 @@ if __name__ == "__main__":
     }
     policy_name = 'ICCTPolicy'
 
-    model = PPO(policy_name, env,
-                learning_rate=linear_schedule(args.lr),
+    model = PPO(policy_name, envs,
+                learning_rate=args.lr, # OR: linear_schedule(args.lr)
+                n_steps=args.n_steps,
                 batch_size=args.batch_size,
                 ent_coef=args.ent_coef,
                 clip_range=args.clip_range,
@@ -201,3 +186,4 @@ if __name__ == "__main__":
                 seed=args.seed)
     
     model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
+    # model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval)
