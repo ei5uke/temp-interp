@@ -14,7 +14,9 @@ python -m temp_interp.run.train \
   --ddt_lr 5e-4 \
   --batch_size 256 \
   --gamma 0.99 \
-  --learning_starts 10000 \
+  --ent-coef 0.1 \
+  --clip-range 0.2 \
+  --clip-range-vf 0.2 \
   --eval_freq 1500 \
   --min_reward 225 \
   --training_steps 500000 \
@@ -26,4 +28,4 @@ python -m temp_interp.run.train \
   --argmax_tau 1.0 \
   --sparse_submodel_type 2 \
   --num_sub_features 2 \
-  | tee temp_interp/run/logs/train_ll.log
+  | tee temp_interp/run/logs/train_ll_lr-5e-4.log

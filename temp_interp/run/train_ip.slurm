@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=DDT-AC
-#SBATCH --output=temp_interp/run/logs/ll/complete_lr-5e-4_seed-0.log
+#SBATCH --output=temp_interp/run/logs/ip/complete_lr-3e-4_seed-0.log
 #SBATCH --cpus-per-task=1
 #SBATCH --time=5:00:00
 #SBATCH --account=rpaleja
@@ -17,23 +17,23 @@ export OMP_NUM_THREADS=1
 # export CUDA_VISIBLE_DEVICES=1
 
 python -m temp_interp.run.train \
-  --env_name lunar \
+  --env_name cart \
   --num_envs 32 \
   --policy_type ddt \
   --seed 0 \
-  --num_leaves 8 \
+  --num_leaves 2 \
   --n_steps 2048 \
-  --lr 5e-4 \
-  --ddt_lr 5e-4 \
+  --lr 3e-4 \
+  --ddt_lr 3e-4 \
   --batch_size 256 \
   --gamma 0.99 \
   --ent-coef 0.0 \
   --clip-range 0.2 \
   --eval_freq 1500 \
-  --min_reward 225 \
+  --min_reward 900 \
   --training_steps 10000000 \
   --log_interval 1 \
-  --save_path /scratch/gilbreth/hirota/temp-interp/temp_interp/run/logs/ll/ \
+  --save_path /scratch/gilbreth/hirota/temp-interp/temp_interp/run/logs/ip/ \
   --use_individual_alpha \
   --gpu \
   --argmax_tau 1.0 \
