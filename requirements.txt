@@ -4,8 +4,8 @@ torchvision
 torchaudio
 swig
 gymnasium[box2d]
+gymnasium[mujoco]
 scikit-learn
 stable-baselines3[extra]
-wandb
 ipdb # optional, for debugging only.
 # flow @ git+https://github.com/flow-project/flow.git
