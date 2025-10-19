@@ -303,7 +303,7 @@ class ICCTPolicy(BasePolicy):
             vf_features = super().extract_features(obs, self.vf_features_extractor)
             return pi_features, vf_features
 
-    def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None) -> Distribution:
         """
         Retrieve action distribution given the latent codes.
 
@@ -312,8 +312,9 @@ class ICCTPolicy(BasePolicy):
         """
         mean_actions = self.action_net(latent_pi)
         # new to RPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py
-        z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
-        mean_actions = mean_actions + z
+        if actions is not None:
+            z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
+            mean_actions = mean_actions + z
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
 
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
@@ -345,7 +346,7 @@ class ICCTPolicy(BasePolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
-        distribution = self._get_action_dist_from_latent(latent_pi)
+        distribution = self._get_action_dist_from_latent(latent_pi, actions)
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
         return values, log_prob, entropy # currently notn sure if we can even get entropy here
