@@ -60,6 +60,7 @@ class ICCT(nn.Module):
         self.leaf_init_information = leaves
         self.hard_node = hard_node
         self.argmax_tau = argmax_tau
+        self.depth = 0
 
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -109,6 +110,7 @@ class ICCT(nn.Module):
                 depth = int(np.floor(np.log2(self.leaf_init_information)))
             else:
                 depth = 4
+            self.depth = depth
             for level in range(depth):
                 for node in range(2**level):
                     comparators.append(np.random.normal(0, 1.0, 1))
@@ -409,3 +411,88 @@ class ICCT(nn.Module):
 
         mus = self.tanh(mus)
         return mus
+        
+    def forward_input_compressions(self, input_data, embedding_list=None):
+        with torch.no_grad():
+            # self.comparators: [num_node, 1]
+
+            if self.hard_node:
+                ## node crispification
+                weights = torch.abs(self.layers)
+                # onehot_weights: [num_nodes, num_leaves]
+                onehot_weights = self.diff_argmax(weights)
+                # divisors: [num_node, 1]
+                divisors = (weights * onehot_weights).sum(-1).unsqueeze(-1)
+                # fill 0 with 1
+                divisors_filler = torch.zeros(divisors.size()).to(divisors.device)
+                divisors_filler[divisors==0] = 1
+                divisors = divisors + divisors_filler
+                new_comps = self.comparators / divisors
+                new_weights = self.layers * onehot_weights / divisors
+                new_alpha = self.alpha
+            else:
+                new_comps = self.comparators
+                new_weights = self.layers
+                new_alpha = self.alpha
+
+            # original input_data dim: [batch_size, input_dim]
+            input_copy = input_data.clone()
+            input_data = input_data.t().expand(new_weights.size(0), *input_data.t().size())
+            # layers: [num_node, input_dim]
+            # input_data dim: [batch_size, num_node, input_dim]
+            input_data = input_data.permute(2, 0, 1)
+            # after discretization, some weights can be -1 depending on their origal values
+            # comp dim: [batch_size, num_node, 1]
+            comp = new_weights.mul(input_data)
+            comp = comp.sum(dim=2).unsqueeze(-1)
+            comp = comp.sub(new_comps.expand(input_data.size(0), *new_comps.size()))
+            if self.use_individual_alpha:
+                comp = comp.mul(new_alpha.expand(input_data.size(0), *new_alpha.size()))
+            else:
+                comp = comp.mul(new_alpha)
+            if self.hard_node:
+                ## outcome crispification
+                # sig_vals: [batch_size, num_node, 2]
+                sig_vals = self.diff_argmax(torch.cat((comp, torch.zeros((input_data.size(0), self.layers.size(0), 1)).to(comp.device)), dim=-1))
+                
+                sig_vals = torch.narrow(sig_vals, 2, 0, 1).squeeze(-1)
+            else:
+                sig_vals = self.sig(comp)
+            # sig_vals: [batch_size, num_node]
+            sig_vals = sig_vals.view(input_data.size(0), -1)
+            # one_minus_sig: [batch_size, num_node]
+            one_minus_sig = torch.ones(sig_vals.size()).to(sig_vals.device)
+            one_minus_sig = torch.sub(one_minus_sig, sig_vals)
+            
+            # left_path_probs: [num_leaves, num_nodes]
+            left_path_probs = self.left_path_sigs.t()
+            right_path_probs = self.right_path_sigs.t()
+            # left_path_probs: [batch_size, num_leaves, num_nodes]
+            left_path_probs = left_path_probs.expand(input_data.size(0), *left_path_probs.size()) * sig_vals.unsqueeze(
+                1)
+            right_path_probs = right_path_probs.expand(input_data.size(0),
+                                                    *right_path_probs.size()) * one_minus_sig.unsqueeze(1)
+            # left_path_probs: [batch_size, num_nodes, num_leaves]
+            left_path_probs = left_path_probs.permute(0, 2, 1)
+            right_path_probs = right_path_probs.permute(0, 2, 1)
+
+            # We don't want 0s to ruin leaf probabilities, so replace them with 1s so they don't affect the product
+            left_filler = torch.zeros(self.left_path_sigs.size()).to(left_path_probs.device)
+            left_filler[self.left_path_sigs == 0] = 1
+            right_filler = torch.zeros(self.right_path_sigs.size()).to(left_path_probs.device)
+            right_filler[self.right_path_sigs == 0] = 1
+
+            # probs: [batch_size, num_nodes, num_leaves]
+            probs = left_path_probs.add(right_path_probs)
+
+            # Get the output of every hidden layer like how an NN would
+            input_compressions = []
+            for sample in probs:
+                sample_input_compressions = []
+                start = 0
+                for level in range(self.depth):
+                    dense_sample = torch.nansum(sample[start:start+2**level], dim=0)
+                    sample_input_compressions.append(dense_sample[::2**(self.depth - level - 1)])
+                    start += 2**level
+                input_compressions.append(sample_input_compressions)
+            return input_compressions
