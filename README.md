@@ -26,7 +26,8 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 
 ## TO-DO
 ### Overall
-- [ ] Add PPO w/ ICCT (one thing to note is that the policy gradient loss is really low)
+- [x] Add PPO w/ ICCT ~~(one thing to note is that the policy gradient loss is really low)~~
+    - (Oct 20, 2025) performed experiments (IP, LL, LK) with results matching SAC in original paper.
 - [ ] Add PPO w/ ICCT + Action Chunking
 - [ ] Add MINE/InfoNCE within PPO `learn()`
 
@@ -40,3 +41,5 @@ We acknowledge the following resources that have helped our project.
 - [DDTs](https://github.com/CORE-Robotics-Lab/Interpretable_DDTS_AISTATS2020)
 - [StableBaselines3](https://github.com/DLR-RM/stable-baselines3)
 - [CleanRL](https://github.com/vwxyzjn/cleanrl/tree/master)
+- [The 37 Implementation Details of Proximal Policy Optimization](https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/)
+- [Reasons against explicit evaluation](https://github.com/vwxyzjn/cleanrl/issues/310)
