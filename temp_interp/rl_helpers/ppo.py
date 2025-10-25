@@ -189,8 +189,8 @@ class PPO(OnPolicyAlgorithm):
             self._setup_model()
 
         # adding to calculate InfoNCELoss for estimating mutual information
-        self.input_mutual_info_head = [th.nn.Linear(2**i, self.policy.flattened_obs_dim) for i in range(1, self.policy.action_net.depth+1)]
-        self.output_mutual_info_head = [th.nn.Linear(2**i, self.policy.action_dim) for i in range(1, self.policy.action_net.depth+1)]
+        self.input_mutual_info_head = [th.nn.Linear(2**i, self.policy.flattened_obs_dim).to(device) for i in range(1, self.policy.action_net.depth+1)]
+        self.output_mutual_info_head = [th.nn.Linear(2**i, self.policy.action_dim).to(device) for i in range(1, self.policy.action_net.depth+1)]
         # might need to add an additional head for each layer in the ICCT
 
     def _setup_model(self) -> None:
@@ -326,8 +326,10 @@ class PPO(OnPolicyAlgorithm):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # information bottleneck
-        obs_batch = th.vstack([rollout_data.observations for rollout_data in self.rollout_buffer.get(self.batch_size)])
-        action_batch = th.vstack([rollout_data.actions for rollout_data in self.rollout_buffer.get(self.batch_size)])
+        ib_batch_size = self.batch_size
+        ib_batch = next(self.rollout_buffer.get(ib_batch_size))
+        obs_batch = ib_batch.observations
+        action_batch = ib_batch.actions
         with th.no_grad():
             # shape (B, L, n): batch, num_layers, `compression` size
             input_compressions = self.policy.forward_info_bottleneck(obs_batch)
@@ -335,8 +337,8 @@ class PPO(OnPolicyAlgorithm):
             for k in range(len(self.input_mutual_info_head)):
                 input_query = self.input_mutual_info_head[k](th.stack(input_compressions[k])) # map compressions to obs dim
                 output_query = self.output_mutual_info_head[k](th.stack(input_compressions[k])) # map compressions to action dim
-                self.logger.record(f"train/input_MI_{k}", np.log(self.batch_size) - InfoNCE()(input_query, obs_batch))
-                self.logger.record(f"train/output_MI_{k}", np.log(self.batch_size) - InfoNCE()(output_query, action_batch))
+                self.logger.record(f"train/input_MI_{k}", np.log(ib_batch_size) - InfoNCE()(input_query, obs_batch).cpu().item())
+                self.logger.record(f"train/output_MI_{k}", np.log(ib_batch_size) - InfoNCE()(output_query, action_batch).cpu().item())
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
