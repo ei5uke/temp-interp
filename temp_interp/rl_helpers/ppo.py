@@ -15,22 +15,8 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import FloatSchedule, explained_variance
 from temp_interp.rl_helpers.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy, ICCTPolicy
-from info_nce import InfoNCE, info_nce
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
-
-# def info_nce_mi(z, a_logits, temperature=0.1):
-#     """
-#     z: [batch, z_dim]
-#     a_logits: [batch, action_dim]
-#     """
-#     z = F.normalize(z, dim=-1)
-#     a = F.normalize(F.softmax(a_logits, dim=-1), dim=-1)
-#     logits = z @ a.T / temperature
-#     labels = torch.arange(z.size(0)).to(z.device)
-#     loss = F.cross_entropy(logits, labels)
-#     mi_est = math.log(z.size(0)) - loss.item()
-#     return mi_est
 
 class PPO(OnPolicyAlgorithm):
     """
@@ -188,10 +174,12 @@ class PPO(OnPolicyAlgorithm):
         if _init_setup_model:
             self._setup_model()
 
-        # adding to calculate InfoNCELoss for estimating mutual information
-        self.input_mutual_info_head = [th.nn.Linear(2**i, self.policy.flattened_obs_dim).to(device) for i in range(1, self.policy.action_net.depth+1)]
-        self.output_mutual_info_head = [th.nn.Linear(2**i, self.policy.action_dim).to(device) for i in range(1, self.policy.action_net.depth+1)]
-        # might need to add an additional head for each layer in the ICCT
+        # project actions, states, and leaf probabilities to the same dimension
+        # self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
+        self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+        self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
+        self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
+        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -325,20 +313,36 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        # information bottleneck
-        ib_batch_size = self.batch_size
-        ib_batch = next(self.rollout_buffer.get(ib_batch_size))
-        obs_batch = ib_batch.observations
-        action_batch = ib_batch.actions
+        ### mutual information (mi) analysis
+        mi_batch_size = 4096
+        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        obs_batch = mi_batch.observations
+        action_batch = mi_batch.actions
+        temp = 0.1
+
         with th.no_grad():
-            # shape (B, L, n): batch, num_layers, `compression` size
-            input_compressions = self.policy.forward_info_bottleneck(obs_batch)
-            input_compressions = list(zip(*input_compressions))
-            for k in range(len(self.input_mutual_info_head)):
-                input_query = self.input_mutual_info_head[k](th.stack(input_compressions[k])) # map compressions to obs dim
-                output_query = self.output_mutual_info_head[k](th.stack(input_compressions[k])) # map compressions to action dim
-                self.logger.record(f"train/input_MI_{k}", np.log(ib_batch_size) - InfoNCE()(input_query, obs_batch).cpu().item())
-                self.logger.record(f"train/output_MI_{k}", np.log(ib_batch_size) - InfoNCE()(output_query, action_batch).cpu().item())
+            # estimate policy complexity
+            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+            a_proj = F.normalize(self.action_proj(action_batch), dim=1)
+            similarity = th.matmul(s_proj, a_proj.T) / temp
+            labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
+            loss_sa = F.cross_entropy(similarity, labels)
+            loss_as = F.cross_entropy(similarity.T, labels)
+            loss = (loss_sa + loss_as) / 2
+            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
+            # information bottleneck no layers
+            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+            s_similarity = th.matmul(s_proj, l_proj.T) / temp
+            a_similarity = th.matmul(a_proj, l_proj.T) / temp
+            loss_sl = F.cross_entropy(s_similarity, labels)
+            loss_ls = F.cross_entropy(s_similarity.T, labels)
+            loss_s = (loss_sl + loss_ls) / 2
+            loss_al = F.cross_entropy(a_similarity, labels)
+            loss_la = F.cross_entropy(a_similarity.T, labels)
+            loss_a = (loss_al + loss_la) / 2
+            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
+            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
