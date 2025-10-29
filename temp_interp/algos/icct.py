@@ -413,6 +413,12 @@ class ICCT(nn.Module):
         return mus
         
     def forward_input_compressions(self, input_data, embedding_list=None):
+        """
+        Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
+        
+        :param input_data: The observation batch
+        :return: The batch of leaf probabilities.
+        """
         with torch.no_grad():
             # self.comparators: [num_node, 1]
 
@@ -482,17 +488,12 @@ class ICCT(nn.Module):
             right_filler = torch.zeros(self.right_path_sigs.size()).to(left_path_probs.device)
             right_filler[self.right_path_sigs == 0] = 1
 
-            # probs: [batch_size, num_nodes, num_leaves]
-            probs = left_path_probs.add(right_path_probs)
-
-            # Get the output of every hidden layer like how an NN would
-            input_compressions = []
-            for sample in probs:
-                sample_input_compressions = []
-                start = 0
-                for level in range(self.depth):
-                    dense_sample = torch.nansum(sample[start:start+2**level], dim=0)
-                    sample_input_compressions.append(dense_sample[::2**(self.depth - level - 1)])
-                    start += 2**level
-                input_compressions.append(sample_input_compressions)
-            return input_compressions
+            # left_path_probs: [batch_size, num_nodes, num_leaves]
+            left_path_probs = left_path_probs.add(left_filler)
+            right_path_probs = right_path_probs.add(right_filler)
+            
+            # probs: [batch_size, 2*num_nodes, num_leaves]
+            probs = torch.cat((left_path_probs, right_path_probs), dim=1)
+            # probs: [batch_size, num_leaves]
+            probs = probs.prod(dim=1)
+            return probs

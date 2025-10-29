@@ -282,10 +282,10 @@ class ICCTPolicy(BasePolicy):
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
-        Return the forward pass representation of the input after each layer in the actor.
+        Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
 
         :param obs: Observation
-        :return: The list of compressed inputs after each layer.
+        :return: The batch of leaf probabilities.
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
@@ -294,7 +294,6 @@ class ICCTPolicy(BasePolicy):
         else:
             pi_features, vf_features = features
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
-        # get each input compression (including the final action)
         input_compressions = self.action_net.forward_input_compressions(latent_pi)
         return input_compressions
 
