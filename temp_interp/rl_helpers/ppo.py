@@ -174,6 +174,13 @@ class PPO(OnPolicyAlgorithm):
         if _init_setup_model:
             self._setup_model()
 
+        # project actions, states, and leaf probabilities to the same dimension
+        # self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
+        self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+        self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
+        self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
+        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+
     def _setup_model(self) -> None:
         super()._setup_model()
 
@@ -306,6 +313,37 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
+        ### mutual information (mi) analysis
+        mi_batch_size = 4096
+        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        obs_batch = mi_batch.observations
+        action_batch = mi_batch.actions
+        temp = 0.1
+
+        with th.no_grad():
+            # estimate policy complexity
+            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+            a_proj = F.normalize(self.action_proj(action_batch), dim=1)
+            similarity = th.matmul(s_proj, a_proj.T) / temp
+            labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
+            loss_sa = F.cross_entropy(similarity, labels)
+            loss_as = F.cross_entropy(similarity.T, labels)
+            loss = (loss_sa + loss_as) / 2
+            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
+            # information bottleneck no layers
+            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+            s_similarity = th.matmul(s_proj, l_proj.T) / temp
+            a_similarity = th.matmul(a_proj, l_proj.T) / temp
+            loss_sl = F.cross_entropy(s_similarity, labels)
+            loss_ls = F.cross_entropy(s_similarity.T, labels)
+            loss_s = (loss_sl + loss_ls) / 2
+            loss_al = F.cross_entropy(a_similarity, labels)
+            loss_la = F.cross_entropy(a_similarity.T, labels)
+            loss_a = (loss_al + loss_la) / 2
+            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
+            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
+
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
@@ -331,7 +369,9 @@ class PPO(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfPPO:
-        # print(self.policy)
+        print(self.policy)
+        # total_params = sum(param.numel() for param in self.policy.action_net.parameters() if param.requires_grad)
+        # print(f"Total trainable parameters: {total_params}")
         # exit()
         return super().learn(
             total_timesteps=total_timesteps,

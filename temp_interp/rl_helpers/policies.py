@@ -14,7 +14,7 @@ import torch as th
 from torch import nn
 from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution, StateDependentNoiseDistribution
 from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.preprocessing import get_action_dim
+from stable_baselines3.common.preprocessing import get_flattened_obs_dim, get_action_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
     FlattenExtractor,
@@ -93,6 +93,7 @@ class ICCTPolicy(BasePolicy):
         )
         
         self.observation_space = observation_space
+        self.flattened_obs_dim = get_flattened_obs_dim(self.observation_space)
         self.action_space = action_space
         self.action_dim = get_action_dim(self.action_space)
         self.ddt_kwargs = ddt_kwargs
@@ -278,6 +279,23 @@ class ICCTPolicy(BasePolicy):
         log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))  # not sure if necessary
         return actions, values, log_prob
+
+    def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
+
+        :param obs: Observation
+        :return: The batch of leaf probabilities.
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, _ = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        input_compressions = self.action_net.forward_input_compressions(latent_pi)
+        return input_compressions
 
     def extract_features(  # type: ignore[override]
         self, obs: PyTorchObs, features_extractor: Optional[BaseFeaturesExtractor] = None
