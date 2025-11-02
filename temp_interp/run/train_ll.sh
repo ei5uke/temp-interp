@@ -1,8 +1,9 @@
 
 module load conda
-conda init
 conda activate temp-interp
 export OMP_NUM_THREADS=1
+
+curr_user=$(whoami)
 # export MKL_NUM_THREADS=1
 # export CUDA_VISIBLE_DEVICES=1
 
@@ -22,7 +23,7 @@ python -m temp_interp.run.train \
   --min_reward 225 \
   --training_steps 500000 \
   --log_interval 4 \
-  --save_path /scratch/gilbreth/sane0/temp-interp/temp_interp/run/logs/ll/ \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
   --use_individual_alpha \
   --submodels \
   --hard_node \

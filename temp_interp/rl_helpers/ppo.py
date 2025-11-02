@@ -230,7 +230,7 @@ class PPO(OnPolicyAlgorithm):
         assert self._last_obs is not None, "No previous observation was provided"
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
-
+        self.action_space = self.policy.action_space
         n_steps = 0
         rollout_buffer.reset()
         # Sample new weights for the state dependent exploration
@@ -249,7 +249,7 @@ class PPO(OnPolicyAlgorithm):
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
                 actions, values, log_prob = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
-            print("Just actions: ", actions)
+            # print("Just actions: ", actions)
 
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
@@ -264,14 +264,14 @@ class PPO(OnPolicyAlgorithm):
             
             
             # clipped_actions = clipped_actions.reshape((-1, *self.policy.action_space.shape[0]/self.time_horizon))
-            print("Clipped actions", clipped_actions)
+            # print("Clipped actions", clipped_actions)
             self.past_actions.append(clipped_actions)
             self.past_log_probs.append(log_prob)
             
             # past_actions = list(self.past_actions)
 
             # horizon if less than 3
-            dim = get_action_dim(self.action_space)
+            dim = get_action_dim(self.action_space)//self.time_horizon
             # horizon = min(len(past_actions), self.time_horizon)
             # select corresponding actions
             arr = np.stack(self.past_actions)                    # shape (n_chunks, 6)
@@ -284,12 +284,11 @@ class PPO(OnPolicyAlgorithm):
 
             # Select the diagonal elements (n, action_dim)
             selected = arr[mask].reshape(n, dim)
-            weighted_action = np.mean(selected, axis=0)
-            
-            print(weighted_action)
+            weighted_action = np.array([np.mean(selected, axis=0)])
+
+            # print("Weighted action: ", weighted_action)
+
             new_obs, rewards, dones, infos = env.step(weighted_action)
-
-
 
             self.num_timesteps += env.num_envs
 
@@ -319,7 +318,6 @@ class PPO(OnPolicyAlgorithm):
                     rewards[idx] += self.gamma * terminal_value
 
             # print(selected.flatten())
-            # print(weighted_action)
             # print("Log prob: ", log_prob)
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
