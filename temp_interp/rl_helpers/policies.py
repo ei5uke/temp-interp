@@ -74,6 +74,7 @@ class ICCTPolicy(BasePolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         ddt_kwargs: Dict[str, Any] = None,
+        time_horizon: int = 3
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -94,8 +95,17 @@ class ICCTPolicy(BasePolicy):
         
         self.observation_space = observation_space
         self.flattened_obs_dim = get_flattened_obs_dim(self.observation_space)
-        self.action_space = action_space
+        new_shape = (action_space.shape[0] * time_horizon,)
+        new_low = np.tile(action_space.low, time_horizon)
+        new_high = np.tile(action_space.high, time_horizon)
+
+        self.action_space = spaces.Box(low=new_low, high=new_high, shape=new_shape, dtype=action_space.dtype)
+        # self.action_space = action_space 
+        print(self.action_space.shape)
+        print(self.action_space.low.shape)
+        print(self.action_space.high.shape)
         self.action_dim = get_action_dim(self.action_space)
+        print(self.action_dim, "<--- dim")
         self.ddt_kwargs = ddt_kwargs
         self.rpo_alpha = 0.5 # Robust Policy Optimization addition
 
@@ -277,6 +287,8 @@ class ICCTPolicy(BasePolicy):
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
+        # print(actions)
+        # print(log_prob)
         actions = actions.reshape((-1, *self.action_space.shape))  # not sure if necessary
         return actions, values, log_prob
 
@@ -365,6 +377,7 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
+        # print("Actions: ", actions)
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
         return values, log_prob, entropy # currently notn sure if we can even get entropy here

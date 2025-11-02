@@ -7,13 +7,18 @@ from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
 import torch as th
+from collections import deque
 from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import FloatSchedule, explained_variance
+from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
+from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.preprocessing import get_action_dim
+
 from temp_interp.rl_helpers.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy, ICCTPolicy
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
@@ -109,6 +114,7 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        time_horizon: int = 3
     ):
         super().__init__(
             policy,
@@ -170,6 +176,9 @@ class PPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.time_horizon = time_horizon
+        self.past_actions = deque(maxlen=self.time_horizon)
+        self.past_log_probs = deque(maxlen=self.time_horizon)
 
         if _init_setup_model:
             self._setup_model()
@@ -191,6 +200,150 @@ class PPO(OnPolicyAlgorithm):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
             self.clip_range_vf = FloatSchedule(self.clip_range_vf)
+
+    def collect_rollouts(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        n_rollout_steps: int,
+    ) -> bool:
+        """
+        Most of the following code is from https://github.com/DLR-RM/stable-baselines3/blob/b018e4bc949503b990c3012c0e36c9384de770e6/stable_baselines3/common/on_policy_algorithm.py#L162
+
+        With some added stuff like:
+        - a variable to keep track of the past action chunks for temporal ensemble
+        - using a linear weighted action for env.step
+        - a variable to capture the past log_probs and a weighted sum of them to be passed into the rollout_buffer.add
+        Collect experiences using the current policy and fill a ``RolloutBuffer``.
+        The term rollout here refers to the model-free notion and should not
+        be used with the concept of rollout used in model-based RL or planning.
+
+        :param env: The training environment
+        :param callback: Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param rollout_buffer: Buffer to fill with rollouts
+        :param n_rollout_steps: Number of experiences to collect per environment
+        :return: True if function returned with at least `n_rollout_steps`
+            collected, False if callback terminated rollout prematurely.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(False)
+
+        n_steps = 0
+        rollout_buffer.reset()
+        # Sample new weights for the state dependent exploration
+        if self.use_sde:
+            self.policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        while n_steps < n_rollout_steps:
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.policy.reset_noise(env.num_envs)
+
+            with th.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
+                actions, values, log_prob = self.policy(obs_tensor)
+            actions = actions.cpu().numpy()
+            print("Just actions: ", actions)
+
+            if isinstance(self.action_space, spaces.Box):
+                if self.policy.squash_output:
+                    # Unscale the actions to match env bounds
+                    # if they were previously squashed (scaled in [-1, 1])
+                    clipped_actions = self.policy.unscale_action(clipped_actions)
+                else:
+                    # Otherwise, clip the actions to avoid out of bound error
+                    # as we are sampling from an unbounded Gaussian distribution
+                    # print(self.policy.action_space.low)
+                    clipped_actions = np.clip(actions, self.policy.action_space.low, self.policy.action_space.high)
+            
+            
+            # clipped_actions = clipped_actions.reshape((-1, *self.policy.action_space.shape[0]/self.time_horizon))
+            print("Clipped actions", clipped_actions)
+            self.past_actions.append(clipped_actions)
+            self.past_log_probs.append(log_prob)
+            
+            # past_actions = list(self.past_actions)
+
+            # horizon if less than 3
+            dim = get_action_dim(self.action_space)
+            # horizon = min(len(past_actions), self.time_horizon)
+            # select corresponding actions
+            arr = np.stack(self.past_actions)                    # shape (n_chunks, 6)
+            # print(arr)
+            n = arr.shape[0]
+            arr = arr.reshape(n, 3, dim)  # (n, 3, 2)
+
+            # Make an index mask for the diagonal: (n, chunk_horizon)
+            mask = np.eye(3, dtype=bool)[:n]     # pick diagonals up to n
+
+            # Select the diagonal elements (n, action_dim)
+            selected = arr[mask].reshape(n, dim)
+            weighted_action = np.mean(selected, axis=0)
+            
+            print(weighted_action)
+            new_obs, rewards, dones, infos = env.step(weighted_action)
+
+
+
+            self.num_timesteps += env.num_envs
+
+            # Give access to local variables
+            callback.update_locals(locals())
+            if not callback.on_step():
+                return False
+
+            self._update_info_buffer(infos, dones)
+            n_steps += 1
+
+            if isinstance(self.action_space, spaces.Discrete):
+                # Reshape in case of discrete action
+                actions = actions.reshape(-1, 1)
+
+            # Handle timeout by bootstrapping with value function
+            # see GitHub issue #633
+            for idx, done in enumerate(dones):
+                if (
+                    done
+                    and infos[idx].get("terminal_observation") is not None
+                    and infos[idx].get("TimeLimit.truncated", False)
+                ):
+                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    with th.no_grad():
+                        terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
+                    rewards[idx] += self.gamma * terminal_value
+
+            # print(selected.flatten())
+            # print(weighted_action)
+            # print("Log prob: ", log_prob)
+            rollout_buffer.add(
+                self._last_obs,  # type: ignore[arg-type]
+                weighted_action,
+                rewards,
+                self._last_episode_starts,  # type: ignore[arg-type]
+                values,
+                log_prob,
+            )
+            self._last_obs = new_obs  # type: ignore[assignment]
+            self._last_episode_starts = dones
+
+        with th.no_grad():
+            # Compute value for the last timestep
+            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+
+        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+
+        callback.update_locals(locals())
+
+        callback.on_rollout_end()
+
+        return True
+
 
     def train(self) -> None:
         """
@@ -217,6 +370,7 @@ class PPO(OnPolicyAlgorithm):
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 actions = rollout_data.actions
+                # print("Actions from rollout buffer: ", actions)
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
