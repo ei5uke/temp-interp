@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
 import torch as th
-from collections import deque
+from collections import deque, defaultdict
 from gymnasium import spaces
 from torch.nn import functional as F
 
@@ -180,6 +180,12 @@ class PPO(OnPolicyAlgorithm):
         self.past_actions = deque(maxlen=self.time_horizon)
         self.past_log_probs = deque(maxlen=self.time_horizon)
 
+        self.all_actions = defaultdict(list)
+
+        # Dictionary to map weighted actions (what was executed) to original 6D actions (for training)
+        self.action_mapping = {}
+        self.rollout_timestep = 0  # Counter for timesteps within a rollout
+
         if _init_setup_model:
             self._setup_model()
 
@@ -238,7 +244,7 @@ class PPO(OnPolicyAlgorithm):
             self.policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
-
+        self.all_actions = [[] for i in range(n_rollout_steps//self.batch_size)]
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
@@ -249,40 +255,30 @@ class PPO(OnPolicyAlgorithm):
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
                 actions, values, log_prob = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
-            # print("Just actions: ", actions)
 
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
                     # Unscale the actions to match env bounds
                     # if they were previously squashed (scaled in [-1, 1])
-                    clipped_actions = self.policy.unscale_action(clipped_actions)
+                    clipped_actions = self.policy.unscale_action(actions)
                 else:
                     # Otherwise, clip the actions to avoid out of bound error
                     # as we are sampling from an unbounded Gaussian distribution
-                    # print(self.policy.action_space.low)
                     clipped_actions = np.clip(actions, self.policy.action_space.low, self.policy.action_space.high)
             
             
-            # clipped_actions = clipped_actions.reshape((-1, *self.policy.action_space.shape[0]/self.time_horizon))
-            # print("Clipped actions", clipped_actions)
             self.past_actions.append(clipped_actions)
             self.past_log_probs.append(log_prob)
             
-            # past_actions = list(self.past_actions)
+            print("Past action chunks: ", self.past_actions)
 
-            # horizon if less than 3
             dim = get_action_dim(self.action_space)//self.time_horizon
-            # horizon = min(len(past_actions), self.time_horizon)
-            # select corresponding actions
-            arr = np.stack(self.past_actions)                    # shape (n_chunks, 6)
-            # print(arr)
+
+            # select corresponding actions from the chunk
+            arr = np.stack(self.past_actions)
             n = arr.shape[0]
-            arr = arr.reshape(n, 3, dim)  # (n, 3, 2)
-
-            # Make an index mask for the diagonal: (n, chunk_horizon)
-            mask = np.eye(3, dtype=bool)[:n]     # pick diagonals up to n
-
-            # Select the diagonal elements (n, action_dim)
+            arr = arr.reshape(n, self.time_horizon, dim)
+            mask = np.eye(self.time_horizon, dtype=bool)[:n]
             selected = arr[mask].reshape(n, dim)
             weighted_action = np.array([np.mean(selected, axis=0)])
 
@@ -317,8 +313,6 @@ class PPO(OnPolicyAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                     rewards[idx] += self.gamma * terminal_value
 
-            # print(selected.flatten())
-            # print("Log prob: ", log_prob)
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
                 weighted_action,
@@ -326,7 +320,12 @@ class PPO(OnPolicyAlgorithm):
                 self._last_episode_starts,  # type: ignore[arg-type]
                 values,
                 log_prob,
-            )
+            )            
+
+
+            # Store original actions for training
+            batch = (rollout_buffer.pos-1)//self.batch_size
+            self.all_actions[batch].append(clipped_actions.squeeze())
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
 
@@ -366,9 +365,11 @@ class PPO(OnPolicyAlgorithm):
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
-                actions = rollout_data.actions
-                # print("Actions from rollout buffer: ", actions)
+            for rollout_data, full_action in zip(self.rollout_buffer.get(self.batch_size), self.all_actions):
+
+                # Use corresponding full action instead of the one that was used in inference (for now)
+                actions = th.tensor(np.array(full_action))
+
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
@@ -465,36 +466,36 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        ### mutual information (mi) analysis
-        mi_batch_size = 4096
-        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
-        obs_batch = mi_batch.observations
-        action_batch = mi_batch.actions
-        temp = 0.1
+        # ### mutual information (mi) analysis
+        # mi_batch_size = self.batch_size
+        # mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        # obs_batch = mi_batch.observations
+        # action_batch = mi_batch.actions
+        # temp = 0.1
 
-        with th.no_grad():
-            # estimate policy complexity
-            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
-            a_proj = F.normalize(self.action_proj(action_batch), dim=1)
-            similarity = th.matmul(s_proj, a_proj.T) / temp
-            labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
-            loss_sa = F.cross_entropy(similarity, labels)
-            loss_as = F.cross_entropy(similarity.T, labels)
-            loss = (loss_sa + loss_as) / 2
-            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
-            # information bottleneck no layers
-            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-            s_similarity = th.matmul(s_proj, l_proj.T) / temp
-            a_similarity = th.matmul(a_proj, l_proj.T) / temp
-            loss_sl = F.cross_entropy(s_similarity, labels)
-            loss_ls = F.cross_entropy(s_similarity.T, labels)
-            loss_s = (loss_sl + loss_ls) / 2
-            loss_al = F.cross_entropy(a_similarity, labels)
-            loss_la = F.cross_entropy(a_similarity.T, labels)
-            loss_a = (loss_al + loss_la) / 2
-            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
-            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
+        # with th.no_grad():
+        #     # estimate policy complexity
+        #     s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+        #     a_proj = F.normalize(self.action_proj(action_batch), dim=1)
+        #     similarity = th.matmul(s_proj, a_proj.T) / temp
+        #     labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
+        #     loss_sa = F.cross_entropy(similarity, labels)
+        #     loss_as = F.cross_entropy(similarity.T, labels)
+        #     loss = (loss_sa + loss_as) / 2
+        #     self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
+        #     # information bottleneck no layers
+        #     leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+        #     l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+        #     s_similarity = th.matmul(s_proj, l_proj.T) / temp
+        #     a_similarity = th.matmul(a_proj, l_proj.T) / temp
+        #     loss_sl = F.cross_entropy(s_similarity, labels)
+        #     loss_ls = F.cross_entropy(s_similarity.T, labels)
+        #     loss_s = (loss_sl + loss_ls) / 2
+        #     loss_al = F.cross_entropy(a_similarity, labels)
+        #     loss_la = F.cross_entropy(a_similarity.T, labels)
+        #     loss_a = (loss_al + loss_la) / 2
+        #     self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
+        #     self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
