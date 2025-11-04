@@ -11,6 +11,7 @@ python -m temp_interp.run.train \
   --env_name lunar \
   --policy_type ddt \
   --seed 0 \
+  --num_envs 1\
   --num_leaves 8 \
   --lr 5e-4 \
   --ddt_lr 5e-4 \

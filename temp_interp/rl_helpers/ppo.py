@@ -177,14 +177,6 @@ class PPO(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
         self.time_horizon = time_horizon
-        self.past_actions = deque(maxlen=self.time_horizon)
-        self.past_log_probs = deque(maxlen=self.time_horizon)
-
-        self.all_actions = defaultdict(list)
-
-        # Dictionary to map weighted actions (what was executed) to original 6D actions (for training)
-        self.action_mapping = {}
-        self.rollout_timestep = 0  # Counter for timesteps within a rollout
 
         if _init_setup_model:
             self._setup_model()
@@ -206,140 +198,6 @@ class PPO(OnPolicyAlgorithm):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
             self.clip_range_vf = FloatSchedule(self.clip_range_vf)
-
-    def collect_rollouts(
-        self,
-        env: VecEnv,
-        callback: BaseCallback,
-        rollout_buffer: RolloutBuffer,
-        n_rollout_steps: int,
-    ) -> bool:
-        """
-        Most of the following code is from https://github.com/DLR-RM/stable-baselines3/blob/b018e4bc949503b990c3012c0e36c9384de770e6/stable_baselines3/common/on_policy_algorithm.py#L162
-
-        With some added stuff like:
-        - a variable to keep track of the past action chunks for temporal ensemble
-        - using a linear weighted action for env.step
-        - a variable to capture the past log_probs and a weighted sum of them to be passed into the rollout_buffer.add
-        Collect experiences using the current policy and fill a ``RolloutBuffer``.
-        The term rollout here refers to the model-free notion and should not
-        be used with the concept of rollout used in model-based RL or planning.
-
-        :param env: The training environment
-        :param callback: Callback that will be called at each step
-            (and at the beginning and end of the rollout)
-        :param rollout_buffer: Buffer to fill with rollouts
-        :param n_rollout_steps: Number of experiences to collect per environment
-        :return: True if function returned with at least `n_rollout_steps`
-            collected, False if callback terminated rollout prematurely.
-        """
-        assert self._last_obs is not None, "No previous observation was provided"
-        # Switch to eval mode (this affects batch norm / dropout)
-        self.policy.set_training_mode(False)
-        self.action_space = self.policy.action_space
-        n_steps = 0
-        rollout_buffer.reset()
-        # Sample new weights for the state dependent exploration
-        if self.use_sde:
-            self.policy.reset_noise(env.num_envs)
-
-        callback.on_rollout_start()
-        self.all_actions = [[] for i in range(n_rollout_steps//self.batch_size)]
-        while n_steps < n_rollout_steps:
-            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
-                # Sample a new noise matrix
-                self.policy.reset_noise(env.num_envs)
-
-            with th.no_grad():
-                # Convert to pytorch tensor or to TensorDict
-                obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                actions, values, log_prob = self.policy(obs_tensor)
-            actions = actions.cpu().numpy()
-
-            if isinstance(self.action_space, spaces.Box):
-                if self.policy.squash_output:
-                    # Unscale the actions to match env bounds
-                    # if they were previously squashed (scaled in [-1, 1])
-                    clipped_actions = self.policy.unscale_action(actions)
-                else:
-                    # Otherwise, clip the actions to avoid out of bound error
-                    # as we are sampling from an unbounded Gaussian distribution
-                    clipped_actions = np.clip(actions, self.policy.action_space.low, self.policy.action_space.high)
-            
-            
-            self.past_actions.append(clipped_actions)
-            self.past_log_probs.append(log_prob)
-            
-            print("Past action chunks: ", self.past_actions)
-
-            dim = get_action_dim(self.action_space)//self.time_horizon
-
-            # select corresponding actions from the chunk
-            arr = np.stack(self.past_actions)
-            n = arr.shape[0]
-            arr = arr.reshape(n, self.time_horizon, dim)
-            mask = np.eye(self.time_horizon, dtype=bool)[:n]
-            selected = arr[mask].reshape(n, dim)
-            weighted_action = np.array([np.mean(selected, axis=0)])
-
-            # print("Weighted action: ", weighted_action)
-
-            new_obs, rewards, dones, infos = env.step(weighted_action)
-
-            self.num_timesteps += env.num_envs
-
-            # Give access to local variables
-            callback.update_locals(locals())
-            if not callback.on_step():
-                return False
-
-            self._update_info_buffer(infos, dones)
-            n_steps += 1
-
-            if isinstance(self.action_space, spaces.Discrete):
-                # Reshape in case of discrete action
-                actions = actions.reshape(-1, 1)
-
-            # Handle timeout by bootstrapping with value function
-            # see GitHub issue #633
-            for idx, done in enumerate(dones):
-                if (
-                    done
-                    and infos[idx].get("terminal_observation") is not None
-                    and infos[idx].get("TimeLimit.truncated", False)
-                ):
-                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
-                    with th.no_grad():
-                        terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
-                    rewards[idx] += self.gamma * terminal_value
-
-            rollout_buffer.add(
-                self._last_obs,  # type: ignore[arg-type]
-                weighted_action,
-                rewards,
-                self._last_episode_starts,  # type: ignore[arg-type]
-                values,
-                log_prob,
-            )            
-
-
-            # Store original actions for training
-            batch = (rollout_buffer.pos-1)//self.batch_size
-            self.all_actions[batch].append(clipped_actions.squeeze())
-            self._last_obs = new_obs  # type: ignore[assignment]
-            self._last_episode_starts = dones
-
-        with th.no_grad():
-            # Compute value for the last timestep
-            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
-
-        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
-
-        callback.update_locals(locals())
-
-        callback.on_rollout_end()
-
-        return True
 
 
     def train(self) -> None:
@@ -365,10 +223,9 @@ class PPO(OnPolicyAlgorithm):
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
-            for rollout_data, full_action in zip(self.rollout_buffer.get(self.batch_size), self.all_actions):
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
 
-                # Use corresponding full action instead of the one that was used in inference (for now)
-                actions = th.tensor(np.array(full_action))
+                actions = rollout_data.actions
 
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
@@ -522,7 +379,6 @@ class PPO(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfPPO:
-        print(self.policy)
         # total_params = sum(param.numel() for param in self.policy.action_net.parameters() if param.requires_grad)
         # print(f"Total trainable parameters: {total_params}")
         # exit()
