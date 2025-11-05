@@ -157,9 +157,6 @@ class ICCTPolicy(BasePolicy):
         self.dist_kwargs = dist_kwargs
 
         # Action distribution
-        # self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
-        # self.action_chunk_dist = SquashedDiagGaussianDistribution(self.action_dim)
-        # self.action_dist = SquashedDiagGaussianDistribution(self.action_dim // self.time_horizon)
         self.action_chunk_dist = DiagGaussianDistribution(self.action_dim)
 
         self.og_action_dim = self.action_dim // self.time_horizon
@@ -284,69 +281,59 @@ class ICCTPolicy(BasePolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
 
-        # # get n_envs from obs
-        # n_envs = obs.shape[0]
-        # batch_size = n_envs * self.time_horizon
-
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
+
+        # actions shape: [n_envs, extended_action_dim]
         actions = actions.reshape((-1, *self.action_space.shape))  # not sure if necessary
-        # print("Actions for 2 envs: ", actions)
 
-        chunked_action = actions.reshape(-1, self.time_horizon, self.og_action_dim) # to create chunk like [n_envs, chunk_size, action_dim]
-
-        # print(chunked_action.transpose(0,1))
-        # log_prob_dist = self._get_action_dist_from_latent(latent_pi, actions)
-        # log_prob = log_prob_dist.log_prob(chunked_action.transpose(0,1)) # send it [chunk_size, n_envs, action_dim]
-        # log_prob = log_prob.reshape(n_envs, self.time_horizon)
-
-        action_batches = chunked_action.transpose(0, 1)
-
-        # Get log probs for each action
-        # log_prob = th.stack([
-        #     distribution.distribution.log_prob(action_batches[i])  # Each is shape (n_env, action_dim) -> log_prob shape (n_env,)
-        #     for i in range(self.time_horizon)
-        # ])
-        
-        print("Actions: ", actions)
+        # log prob shape: [n_envs, extended_action dim]
         log_prob = distribution.distribution.log_prob(actions)
-        print("Log prob: ", log_prob)
-        # print(log_prob)
-        # Aggregate Actions
-        self.past_actions.append(action_batches)
-        self.past_log_probs.append(log_prob)
-        # print("Past Actions: ", self.past_actions)
-        # print("Past log_prob: ", self.past_log_probs)
-        (ensemble_action, ensemble_log) = self.temporal_ensemble()
+
+
+        #  [n_envs, extended_action_dim] -> [n_envs, chunk_size, orig_action_dim] -> [chunk_size, n_envs, orig_action_dim]
+        chunked_action = actions.reshape(-1, self.time_horizon, self.og_action_dim).transpose(0,1) 
+
+        #  [n_envs, extended_action_dim] -> [n_envs, chunk_size, 1] -> [chunk_size, n_envs]
+        chunked_log_prob = log_prob.reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=2).transpose(0,1) 
         
-        # print("Ensemble action: ", ensemble_action)
-        # print("Ensemble log: ", ensemble_log)
+
+        # Perform ensemble
+        self.past_actions.append(chunked_action)
+        self.past_log_probs.append(chunked_log_prob)
+        (ensemble_action, ensemble_log) = self._temporal_ensemble()
+
         return ensemble_action, values, ensemble_log
 
-    def temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor]:
+    def _temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor]:
+        """
+        Expects a deque/list of actions and log prob in in the following shape:
+
+        [chunk_size, n_envs, orig_action_dim]
+
+        Aggregates actions across multiple timesteps into one tensor of shape [n_envs, orig_action_dim] which represents an aggregated action for each env at a particular timestep
+
+        Aggregated similarly for log probs but returns a tensor of shape [n_envs] with the aggregated probs across timesteps
+        """    
+
         stacked_actions = th.stack(list(self.past_actions))
-        n_tensors, time_steps, n_envs, action_dim = stacked_actions.shape
+        n_tensors, _, _, _ = stacked_actions.shape
         time_indices = th.arange(n_tensors - 1, -1, -1)
-        # print(time_indices)
-        # print(stacked_actions.shape)
-        # print("ensemble")
-        # print(self.past_actions)
+
         selected_actions = stacked_actions[
-            th.arange(n_tensors),  # tensor dimension
-            time_indices,              # time_step dimension (reversed)
-            :,                         # all environments
-            :                          # all action dims
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :,                          # all environments
+            :                           # all action dims
         ]
         stacked_logs = th.stack(list(self.past_log_probs))
         selected_logs = stacked_logs[
-            th.arange(n_tensors),  # tensor dimension
-            time_indices,              # time_step dimension (reversed)
-            :                          # all environments
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :                           # all environments
         ]
-        print("Selected logs: ", selected_logs)
-        # print()
         return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
