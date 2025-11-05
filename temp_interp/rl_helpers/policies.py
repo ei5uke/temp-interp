@@ -13,7 +13,7 @@ from collections import deque
 from gymnasium import spaces
 import torch as th
 from torch import nn
-from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution, StateDependentNoiseDistribution
+from stable_baselines3.common.distributions import Distribution, DiagGaussianDistribution, StateDependentNoiseDistribution
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, get_action_dim
 from stable_baselines3.common.torch_layers import (
@@ -158,8 +158,9 @@ class ICCTPolicy(BasePolicy):
 
         # Action distribution
         # self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
-        self.action_chunk_dist = SquashedDiagGaussianDistribution(self.action_dim)
-        self.action_dist = SquashedDiagGaussianDistribution(self.action_dim // self.time_horizon)
+        # self.action_chunk_dist = SquashedDiagGaussianDistribution(self.action_dim)
+        # self.action_dist = SquashedDiagGaussianDistribution(self.action_dim // self.time_horizon)
+        self.action_chunk_dist = DiagGaussianDistribution(self.action_dim)
 
         self.og_action_dim = self.action_dim // self.time_horizon
         self._build(lr_schedule)
@@ -297,18 +298,19 @@ class ICCTPolicy(BasePolicy):
         chunked_action = actions.reshape(-1, self.time_horizon, self.og_action_dim) # to create chunk like [n_envs, chunk_size, action_dim]
 
         # print(chunked_action.transpose(0,1))
-        log_prob_dist = self._get_action_dist_from_latent(latent_pi, actions)
+        # log_prob_dist = self._get_action_dist_from_latent(latent_pi, actions)
         # log_prob = log_prob_dist.log_prob(chunked_action.transpose(0,1)) # send it [chunk_size, n_envs, action_dim]
         # log_prob = log_prob.reshape(n_envs, self.time_horizon)
 
         action_batches = chunked_action.transpose(0, 1)
 
-        # Get log probs for each batch
-        log_prob = th.stack([
-            log_prob_dist.log_prob(action_batches[i])  # Each is shape (n_env, action_dim) -> log_prob shape (n_env,)
-            for i in range(self.time_horizon)
-        ])
-
+        # Get log probs for each action
+        # log_prob = th.stack([
+        #     distribution.distribution.log_prob(action_batches[i])  # Each is shape (n_env, action_dim) -> log_prob shape (n_env,)
+        #     for i in range(self.time_horizon)
+        # ])
+        log_prob = distribution.distribution.log_prob(actions)
+        print("Log prob: ", log_prob)
         # print(log_prob)
         # Aggregate Actions
         self.past_actions.append(action_batches)
@@ -399,8 +401,6 @@ class ICCTPolicy(BasePolicy):
             # new to RPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py
             z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
             mean_actions = mean_actions + z
-            # TODO replace 3 with time horizon
-            return self.action_dist.proba_distribution(mean_actions[:, :self.action_dim // 3], self.log_std[:self.action_dim // 3])
         return self.action_chunk_dist.proba_distribution(mean_actions, self.log_std)
     
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
@@ -434,7 +434,7 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
-        log_prob = distribution.log_prob(actions)
+        log_prob = distribution.distribution.log_prob(actions)[:,:self.action_dim].sum(dim=1)
         entropy = distribution.entropy()
         return values, log_prob, entropy
 
