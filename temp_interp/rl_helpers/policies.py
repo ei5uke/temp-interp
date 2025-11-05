@@ -309,6 +309,8 @@ class ICCTPolicy(BasePolicy):
         #     distribution.distribution.log_prob(action_batches[i])  # Each is shape (n_env, action_dim) -> log_prob shape (n_env,)
         #     for i in range(self.time_horizon)
         # ])
+        
+        print("Actions: ", actions)
         log_prob = distribution.distribution.log_prob(actions)
         print("Log prob: ", log_prob)
         # print(log_prob)
@@ -343,7 +345,7 @@ class ICCTPolicy(BasePolicy):
             time_indices,              # time_step dimension (reversed)
             :                          # all environments
         ]
-        # print(selected_actions)
+        print("Selected logs: ", selected_logs)
         # print()
         return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
 
