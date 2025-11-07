@@ -1,20 +1,26 @@
 # reference: https://github.com/CORE-Robotics-Lab/ICCT/blob/main/icct/runfiles/train.py
 # modified to leverage PPO instead of SAC or TD3, directly apply PPO+ICCTs, and PPO+ICCT+action chunking.
 
-import gymnasium as gym
-import numpy as np
 import copy
 import argparse
 import random
 import os
-import torch as th
-from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
-from stable_baselines3.common.torch_layers import (
-    CombinedExtractor,
-    FlattenExtractor
-)
-from typing import Callable
+import time
 
+import torch as th
+import gymnasium as gym
+import highway_env
+import numpy as np
+import wandb
+
+from typing import Callable
+from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import CallbackList
+from wandb.integration.sb3 import WandbCallback
+from stable_baselines3.common.torch_layers import CombinedExtractor, FlattenExtractor
+from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
 #### might have issues b/c hpc isn't ubuntu, figure out later
 # from flow.utils.registry import make_create_env
@@ -22,15 +28,14 @@ from temp_interp.rl_helpers.ppo import PPO
 # from temp_interp.sumo_envs.accel_ring_multilane import ring_accel_lc_params
 # from temp_interp.sumo_envs.accel_figure8 import fig8_params
 ####
-from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.env_util import make_vec_env
 
 def make_env(env_name, gamma):
     def thunk():
-        env = gym.make(env_id)
-        # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        if env_name == 'figure8':
+            create_env, _ = make_create_env(params=fig8_params, version=0)
+            env = create_env()
+        else: env = gym.make(env_id)
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         return env
     return thunk
 
@@ -57,14 +62,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ICCT Training')
     parser.add_argument('--env_name', help='environment to run on', type=str, default='lunar')
     parser.add_argument('--num_envs', help='Number of parallel environments to run', type=int, default=1)
-    parser.add_argument('--alg_type', help='only ppo for now', type=str, default='ppo')
-    parser.add_argument('--policy_type', help='mlp or ddt', type=str, default='ddt')
-    parser.add_argument('--mlp_size', help='the size of mlp (small|medium|large)', type=str, default='medium')
     parser.add_argument('--seed', help='the seed number to use', type=int, default=42)
-    parser.add_argument('--num_leaves', help='number of leaves used in ddt (2^n)', type=int, default=16)
-    parser.add_argument('--submodels', help='if use sub-models in ddt', action='store_true', default=False)
-    parser.add_argument('--sparse_submodel_type', help='the type of the sparse submodel, 1 for L1 regularization, 2 for feature selection, other values for not sparse', type=int, default=0)
-    parser.add_argument('--hard_node', help='if use differentiable crispification', action='store_true', default=False)
+    # PPO kwargs
     parser.add_argument('--gpu', help='if run on a GPU', action='store_true', default=False)
     parser.add_argument('--n_steps', help='Number of steps per batch', type=int, default=2048)
     parser.add_argument('--lr', help='learning rate', type=float, default=3e-4)
@@ -74,6 +73,11 @@ if __name__ == "__main__":
     parser.add_argument('--clip-range-vf', help='the clip range of the value function, must be tuned depending on the env rewards', type=float, default=None)
     parser.add_argument('--ent-coef', help='the entropy coefficient in PPO', type=float, default=0.1)
     parser.add_argument('--training_steps', help='total steps for training the model', type=int, default=500000)
+    # DDT kwargs
+    parser.add_argument('--num_leaves', help='number of leaves used in ddt (2^n)', type=int, default=16)
+    parser.add_argument('--submodels', help='if use sub-models in ddt', action='store_true', default=False)
+    parser.add_argument('--sparse_submodel_type', help='the type of the sparse submodel, 1 for L1 regularization, 2 for feature selection, other values for not sparse', type=int, default=0)
+    parser.add_argument('--hard_node', help='if use differentiable crispification', action='store_true', default=False)
     parser.add_argument('--argmax_tau', help='the temperature of the diff_argmax function', type=float, default=1.0)
     parser.add_argument('--ddt_lr', help='the learning rate of the ddt', type=float, default=3e-4)
     parser.add_argument('--use_individual_alpha', help='if use different alphas for different nodes', action='store_true', default=False)
@@ -88,18 +92,36 @@ if __name__ == "__main__":
     parser.add_argument('--n_eval_episodes', help='the number of episodes for each evaluation during training', type=int, default=5)
     parser.add_argument('--eval_freq', help='evaluation frequence of the model', type=int, default=1500)
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
+    parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
 
-    
     args = parser.parse_args()
     set_random_seed(args.seed) # can add: using_cuda=True
     if args.env_name == 'lunar': env_id = 'LunarLanderContinuous-v3'
     elif args.env_name == 'cart': env_id = 'InvertedPendulum-v5' # update to v5 for compatibility
+    elif args.env_name == 'lane_keeping': env_id = 'lane-keeping-v0'
+    elif args.env_name == 'figure8': env_id = 'figure8'
     envs = make_vec_env(make_env(env_id, args.gamma), n_envs=args.num_envs)
     envs.seed(seed=args.seed)
 
+    ## wandb setup
+    policy_name = 'ICCTPolicy'
+    run_name = f"{env_id}__{args.seed}__{int(time.time())}"
+    if args.use_wandb:
+        wandb_config = {
+            "policy_type": policy_name,
+            "total_timesteps": args.training_steps,
+            "env_name": env_id,
+        }
+        run = wandb.init(
+            project="temp-interp",
+            config=wandb_config,
+            name=run_name,
+            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+            monitor_gym=True,  # auto-upload the videos of agents playing the game
+            # save_code=True,  # optional
+        )
+
     eval_env = gym.make(env_id)
-    # eval_env = gym.wrappers.NormalizeObservation(eval_env)
-    # eval_env = gym.wrappers.NormalizeReward(eval_env, gamma=args.gamma) # don't normalize reward for evaluating env
     eval_env.reset(seed=args.seed)
     log_dir = args.save_path
     if not os.path.exists(log_dir):
@@ -121,13 +143,14 @@ if __name__ == "__main__":
         else:
             method = f'm5b_{args.num_sub_features}'
     
-    # monitor_file_path = log_dir + method + f'_seed{args.seed}'
-    # envs = Monitor(envs, monitor_file_path)
     eval_monitor_file_path = log_dir + 'eval_' + method + f'_seed{args.seed}'
     eval_env = Monitor(eval_env, eval_monitor_file_path)
     callback = EpCheckPointCallback(eval_env=eval_env, best_model_save_path=log_dir, n_eval_episodes=args.n_eval_episodes,
                                     eval_freq=args.eval_freq, minimum_reward=args.min_reward)
-    
+    if args.use_wandb:
+        wandb_callback = WandbCallback(model_save_freq=args.eval_freq, model_save_path=log_dir, verbose=2)
+        callback = CallbackList([callback, wandb_callback])
+
     if args.gpu:
         args.device = 'cuda'
     else:
@@ -143,9 +166,6 @@ if __name__ == "__main__":
     else:
         args.fs_submodel_version = 0
     
-    if args.alg_type != 'ppo':
-        raise Exception('Not a valid RL algorithm type')
-
     ddt_kwargs = {
         'num_leaves': args.num_leaves,
         'submodels': args.submodels,
@@ -161,7 +181,7 @@ if __name__ == "__main__":
         'l1_hard_attn': args.l1_hard_attn,
         'num_sub_features': args.num_sub_features,
         'use_gumbel_softmax': args.use_gumbel_softmax,
-        'alg_type': args.alg_type
+        'alg_type': 'ppo'
     }
     policy_kwargs = {
         'features_extractor_class': features_extractor,
@@ -169,8 +189,6 @@ if __name__ == "__main__":
         'net_arch': {'vf': [64, 64]}, # ICCT uses a qf with [256, 256]; there should be no pi or else a feature_extractor will be made
         'activation_fn': th.nn.Tanh, # can also test around with th.nn.ReLU
     }
-    policy_name = 'ICCTPolicy'
-
     model = PPO(policy_name, envs,
                 learning_rate=args.lr, # OR: linear_schedule(args.lr)
                 n_steps=args.n_steps,
@@ -184,6 +202,5 @@ if __name__ == "__main__":
                 verbose=1,
                 device=args.device,
                 seed=args.seed)
-    
     model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
-    # model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval)
+    if args.use_wandb: run.finish()
