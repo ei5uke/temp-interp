@@ -11,6 +11,7 @@ conda activate temp-interp
 git clone https://github.com/ei5uke/temp-interp.git
 cd temp-interp/
 pip install -e .
+# optionally: follow wandb api key login
 ```
 
 ## Training

@@ -209,3 +209,4 @@ __marimo__/
 # slurm logs
 slurm_logs/
 logs/
+wandb/
