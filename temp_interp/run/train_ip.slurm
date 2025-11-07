@@ -19,7 +19,6 @@ export OMP_NUM_THREADS=1
 python -m temp_interp.run.train \
   --env_name cart \
   --num_envs 32 \
-  --policy_type ddt \
   --seed 0 \
   --num_leaves 2 \
   --n_steps 2048 \
