@@ -29,6 +29,6 @@ python -m temp_interp.run.train \
   --submodels \
   --hard_node \
   --argmax_tau 1.0 \
-  --sparse_submodel_type 2 \
+  --sparse_submodel_type 0 \
   --num_sub_features 2 \
   | tee temp_interp/run/logs/train_ll_lr-5e-4.log

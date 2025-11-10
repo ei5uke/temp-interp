@@ -33,7 +33,7 @@ python -m temp_interp.run.train \
   --min_reward 225 \
   --training_steps 10000000 \
   --log_interval 1 \
-  --save_path /scratch/gilbreth/hirota/temp-interp/temp_interp/run/logs/ll/ \
+  --save_path /scratch/gilbreth/sane0/temp-interp/temp_interp/run/logs/ll/ \
   --use_individual_alpha \
   --gpu \
   --argmax_tau 1.0 \

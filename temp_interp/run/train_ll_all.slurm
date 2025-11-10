@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=CDDT(s)1-2
-#SBATCH --output=temp_interp/run/logs/ll/%x.log
+#SBATCH --job-name=DDT-AC
+#SBATCH --output=temp_interp/run/logs/ll/complete_lr-5e-4_seeds.log
 #SBATCH --cpus-per-task=1
 #SBATCH --time=5:00:00
 #SBATCH --account=rpaleja
@@ -14,7 +14,7 @@ module load conda
 conda activate temp-interp
 export OMP_NUM_THREADS=1
 
-echo "Running ${METHOD} with seed ${SEED}"
+echo "Running ICCT-complete with Action Chunking with seed ${SEED}"
 
 # Base command
 CMD="python -m temp_interp.run.train \
@@ -34,23 +34,26 @@ CMD="python -m temp_interp.run.train \
   --min_reward 225 \
   --training_steps 10000000 \
   --log_interval 1 \
-  --save_path /scratch/gilbreth/sane0/temp-interp/temp_interp/run/logs/ll/${METHOD}_${SEED} \
+  --save_path /scratch/gilbreth/sane0/temp-interp/temp_interp/run/logs/ll/ICCTComplete_${SEED} \
   --use_individual_alpha \
   --gpu \
+  --hard_node \
+  --submodels \
+  --sparse_submodel_type 0 \
   --argmax_tau 1.0"
 
 # Modify based on method
-if [ "${METHOD}" = "M1" ]; then
-  # CDDT (M1) – no submodels, no hard_node
-  echo "Running CDDT (M1) ..."
-elif [ "${METHOD}" = "M2" ]; then
-  # CDDT-Controllers (M2) – submodels, no hard_node
-  CMD="${CMD} --submodels"
-  echo "Running CDDT-Controllers (M2) ..."
-else
-  echo "Unknown METHOD: ${METHOD}"
-  exit 1
-fi
+# if [ "${METHOD}" = "M1" ]; then
+#   # CDDT (M1) – no submodels, no hard_node
+#   echo "Running CDDT (M1) ..."
+# elif [ "${METHOD}" = "M2" ]; then
+#   # CDDT-Controllers (M2) – submodels, no hard_node
+#   CMD="${CMD} --submodels"
+#   echo "Running CDDT-Controllers (M2) ..."
+# else
+#   echo "Unknown METHOD: ${METHOD}"
+#   exit 1
+# fi
 
 # Execute
 eval $CMD

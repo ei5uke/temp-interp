@@ -26,11 +26,11 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.env_util import make_vec_env
 
-def make_env(env_name, gamma):
+def make_env(env_id, gamma):
     def thunk():
         env = gym.make(env_id)
         # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         return env
     return thunk
 

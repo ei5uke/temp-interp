@@ -424,7 +424,7 @@ class ICCTPolicy(BasePolicy):
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
         zero_padding = th.zeros(actions.shape[0], self.action_dim - self.og_action_dim)
-        padded_actions = th.cat((actions, zero_padding), dim=-1)
+        padded_actions = th.cat((actions, zero_padding.to(actions.device)), dim=-1)
         log_prob = distribution.distribution.log_prob(padded_actions)[:,:self.action_dim].sum(dim=1)    
         entropy = distribution.entropy()
         return values, log_prob, entropy
