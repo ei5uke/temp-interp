@@ -15,7 +15,7 @@ conda activate temp-interp
 export OMP_NUM_THREADS=1
 
 echo "Running ICCT-complete with Action Chunking with seed ${SEED}"
-
+curr_user=$(whoami)
 # Base command
 CMD="python -m temp_interp.run.train \
   --env_name lunar \
@@ -34,7 +34,7 @@ CMD="python -m temp_interp.run.train \
   --min_reward 225 \
   --training_steps 10000000 \
   --log_interval 1 \
-  --save_path /scratch/gilbreth/sane0/temp-interp/temp_interp/run/logs/ll/ICCTComplete_${SEED} \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ICCTComplete_${SEED} \
   --use_individual_alpha \
   --gpu \
   --hard_node \
