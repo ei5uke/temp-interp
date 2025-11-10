@@ -31,7 +31,7 @@ from temp_interp.rl_helpers.ppo import PPO
 
 def make_env(env_id, gamma):
     def thunk():
-        if env_name == 'figure8':
+        if env_id == 'figure8':
             create_env, _ = make_create_env(params=fig8_params, version=0)
             env = create_env()
         else: env = gym.make(env_id)
