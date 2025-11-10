@@ -10,6 +10,7 @@ python -m temp_interp.run.train \
   --env_name lunar \
   --num_envs 32 \
   --seed 0 \
+  --num_envs 2\
   --num_leaves 8 \
   --n_steps 2048 \
   --lr 5e-4 \
@@ -20,14 +21,11 @@ python -m temp_interp.run.train \
   --clip-range 0.2 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 10000000 \
-  --log_interval 1 \
+  --training_steps 500000 \
+  --log_interval 4 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
   --use_individual_alpha \
   --argmax_tau 1.0 \
-  --hard_node \
-  --submodels \
   --sparse_submodel_type 0 \
-  | tee temp_interp/run/logs/ll/complete_lr-5e-4.log
-  # --num_sub_features 2 \
-  # --clip-range-vf 0.2 \
+  --num_sub_features 2 \
+  | tee temp_interp/run/logs/train_ll_lr-5e-4.log

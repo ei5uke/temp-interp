@@ -9,10 +9,11 @@ MultiInputPolicy = MultiInputActorCriticPolicy
 import numpy as np
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from collections import deque
 from gymnasium import spaces
 import torch as th
 from torch import nn
-from stable_baselines3.common.distributions import Distribution, SquashedDiagGaussianDistribution, StateDependentNoiseDistribution
+from stable_baselines3.common.distributions import Distribution, DiagGaussianDistribution, StateDependentNoiseDistribution
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, get_action_dim
 from stable_baselines3.common.torch_layers import (
@@ -74,6 +75,7 @@ class ICCTPolicy(BasePolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         ddt_kwargs: Dict[str, Any] = None,
+        time_horizon: int = 3
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -94,10 +96,18 @@ class ICCTPolicy(BasePolicy):
         
         self.observation_space = observation_space
         self.flattened_obs_dim = get_flattened_obs_dim(self.observation_space)
-        self.action_space = action_space
+        new_shape = (action_space.shape[0] * time_horizon,)
+        new_low = np.tile(action_space.low, time_horizon)
+        new_high = np.tile(action_space.high, time_horizon)
+
+        self.action_space = spaces.Box(low=new_low, high=new_high, shape=new_shape, dtype=action_space.dtype)
+        # self.action_space = action_space
         self.action_dim = get_action_dim(self.action_space)
         self.ddt_kwargs = ddt_kwargs
         self.rpo_alpha = 0.5 # Robust Policy Optimization addition
+        self.time_horizon = time_horizon
+        self.past_actions = deque(maxlen=self.time_horizon)
+        self.past_log_probs = deque(maxlen=self.time_horizon)
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
@@ -147,16 +157,15 @@ class ICCTPolicy(BasePolicy):
         self.dist_kwargs = dist_kwargs
 
         # Action distribution
-        # self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
-        self.action_dist = SquashedDiagGaussianDistribution(self.action_space)
+        self.action_chunk_dist = DiagGaussianDistribution(self.action_dim)
 
+        self.og_action_dim = self.action_dim // self.time_horizon
         self._build(lr_schedule)
 
     def _get_constructor_parameters(self) -> dict[str, Any]:
         data = super()._get_constructor_parameters()
 
         default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)  # type: ignore[arg-type, return-value]
-
         data.update(
             dict(
                 net_arch=self.net_arch,
@@ -182,8 +191,8 @@ class ICCTPolicy(BasePolicy):
 
         :param n_envs:
         """
-        assert isinstance(self.action_dist, StateDependentNoiseDistribution), "reset_noise() is only available when using gSDE"
-        self.action_dist.sample_weights(self.log_std, batch_size=n_envs)
+        assert isinstance(self.action_chunk_dist, StateDependentNoiseDistribution), "reset_noise() is only available when using gSDE"
+        self.action_chunk_dist.sample_weights(self.log_std, batch_size=n_envs)
 
     def _build_mlp_extractor(self) -> None:
         """
@@ -233,7 +242,6 @@ class ICCTPolicy(BasePolicy):
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
-            # TODO: check for features_extractor
             # Values from stable-baselines.
             # features_extractor/mlp values are
             # originally from openai/baselines (default gains/init_scales).
@@ -272,13 +280,61 @@ class ICCTPolicy(BasePolicy):
             pi_features, vf_features = features
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
+
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
+
+        # actions shape: [n_envs, extended_action_dim]
         actions = actions.reshape((-1, *self.action_space.shape))  # not sure if necessary
-        return actions, values, log_prob
+
+        # log prob shape: [n_envs, extended_action dim]
+        log_prob = distribution.distribution.log_prob(actions)
+
+
+        #  [n_envs, extended_action_dim] -> [n_envs, chunk_size, orig_action_dim] -> [chunk_size, n_envs, orig_action_dim]
+        chunked_action = actions.reshape(-1, self.time_horizon, self.og_action_dim).transpose(0,1) 
+
+        #  [n_envs, extended_action_dim] -> [n_envs, chunk_size, 1] -> [chunk_size, n_envs]
+        chunked_log_prob = log_prob.reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=2).transpose(0,1) 
+        
+
+        # Perform ensemble
+        self.past_actions.append(chunked_action)
+        self.past_log_probs.append(chunked_log_prob)
+        (ensemble_action, ensemble_log) = self._temporal_ensemble()
+
+        return ensemble_action, values, ensemble_log
+
+    def _temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor]:
+        """
+        Expects a deque/list of actions and log prob in in the following shape:
+
+        [chunk_size, n_envs, orig_action_dim]
+
+        Aggregates actions across multiple timesteps into one tensor of shape [n_envs, orig_action_dim] which represents an aggregated action for each env at a particular timestep
+
+        Aggregated similarly for log probs but returns a tensor of shape [n_envs] with the aggregated probs across timesteps
+        """    
+
+        stacked_actions = th.stack(list(self.past_actions))
+        n_tensors, _, _, _ = stacked_actions.shape
+        time_indices = th.arange(n_tensors - 1, -1, -1)
+
+        selected_actions = stacked_actions[
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :,                          # all environments
+            :                           # all action dims
+        ]
+        stacked_logs = th.stack(list(self.past_log_probs))
+        selected_logs = stacked_logs[
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :                           # all environments
+        ]
+        return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -324,17 +380,18 @@ class ICCTPolicy(BasePolicy):
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None) -> Distribution:
         """
         Retrieve action distribution given the latent codes.
+        If actions is given, then evaluate at the action-level, not the action-chunk-level.
 
         :param latent_pi: Latent code for the actor
         :return: Action distribution
         """
         mean_actions = self.action_net(latent_pi)
-        # new to RPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py
         if actions is not None:
+            # new to RPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py
             z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
             mean_actions = mean_actions + z
-        return self.action_dist.proba_distribution(mean_actions, self.log_std)
-
+        return self.action_chunk_dist.proba_distribution(mean_actions, self.log_std)
+    
     def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
         """
         Get the action according to the policy for a given observation.
@@ -355,6 +412,7 @@ class ICCTPolicy(BasePolicy):
         :return: estimated value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
+
         # Preprocess the observation if needed
         features = self.extract_features(obs)
         if self.share_features_extractor:
@@ -365,9 +423,11 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
-        log_prob = distribution.log_prob(actions)
+        zero_padding = th.zeros(actions.shape[0], self.action_dim - self.og_action_dim)
+        padded_actions = th.cat((actions, zero_padding.to(actions.device)), dim=-1)
+        log_prob = distribution.distribution.log_prob(padded_actions)[:,:self.action_dim].sum(dim=1)    
         entropy = distribution.entropy()
-        return values, log_prob, entropy # currently notn sure if we can even get entropy here
+        return values, log_prob, entropy
 
     def get_distribution(self, obs: PyTorchObs) -> Distribution:
         """

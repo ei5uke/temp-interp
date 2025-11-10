@@ -29,7 +29,7 @@ from temp_interp.rl_helpers.ppo import PPO
 # from temp_interp.sumo_envs.accel_figure8 import fig8_params
 ####
 
-def make_env(env_name, gamma):
+def make_env(env_id, gamma):
     def thunk():
         if env_name == 'figure8':
             create_env, _ = make_create_env(params=fig8_params, version=0)

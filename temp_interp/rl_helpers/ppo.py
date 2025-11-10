@@ -7,13 +7,18 @@ from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
 import torch as th
+from collections import deque, defaultdict
 from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import FloatSchedule, explained_variance
+from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
+from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.preprocessing import get_action_dim
+
 from temp_interp.rl_helpers.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy, ICCTPolicy
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
@@ -109,6 +114,7 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        time_horizon: int = 3
     ):
         super().__init__(
             policy,
@@ -170,6 +176,7 @@ class PPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.time_horizon = time_horizon
 
         if _init_setup_model:
             self._setup_model()
@@ -191,6 +198,7 @@ class PPO(OnPolicyAlgorithm):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
             self.clip_range_vf = FloatSchedule(self.clip_range_vf)
+
 
     def train(self) -> None:
         """
@@ -216,7 +224,9 @@ class PPO(OnPolicyAlgorithm):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
+
                 actions = rollout_data.actions
+
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
@@ -313,36 +323,36 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        ### mutual information (mi) analysis
-        mi_batch_size = 4096
-        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
-        obs_batch = mi_batch.observations
-        action_batch = mi_batch.actions
-        temp = 0.1
+        # ### mutual information (mi) analysis
+        # mi_batch_size = self.batch_size
+        # mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        # obs_batch = mi_batch.observations
+        # action_batch = mi_batch.actions
+        # temp = 0.1
 
-        with th.no_grad():
-            # estimate policy complexity
-            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
-            a_proj = F.normalize(self.action_proj(action_batch), dim=1)
-            similarity = th.matmul(s_proj, a_proj.T) / temp
-            labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
-            loss_sa = F.cross_entropy(similarity, labels)
-            loss_as = F.cross_entropy(similarity.T, labels)
-            loss = (loss_sa + loss_as) / 2
-            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
-            # information bottleneck no layers
-            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-            s_similarity = th.matmul(s_proj, l_proj.T) / temp
-            a_similarity = th.matmul(a_proj, l_proj.T) / temp
-            loss_sl = F.cross_entropy(s_similarity, labels)
-            loss_ls = F.cross_entropy(s_similarity.T, labels)
-            loss_s = (loss_sl + loss_ls) / 2
-            loss_al = F.cross_entropy(a_similarity, labels)
-            loss_la = F.cross_entropy(a_similarity.T, labels)
-            loss_a = (loss_al + loss_la) / 2
-            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
-            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
+        # with th.no_grad():
+        #     # estimate policy complexity
+        #     s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+        #     a_proj = F.normalize(self.action_proj(action_batch), dim=1)
+        #     similarity = th.matmul(s_proj, a_proj.T) / temp
+        #     labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
+        #     loss_sa = F.cross_entropy(similarity, labels)
+        #     loss_as = F.cross_entropy(similarity.T, labels)
+        #     loss = (loss_sa + loss_as) / 2
+        #     self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
+        #     # information bottleneck no layers
+        #     leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+        #     l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+        #     s_similarity = th.matmul(s_proj, l_proj.T) / temp
+        #     a_similarity = th.matmul(a_proj, l_proj.T) / temp
+        #     loss_sl = F.cross_entropy(s_similarity, labels)
+        #     loss_ls = F.cross_entropy(s_similarity.T, labels)
+        #     loss_s = (loss_sl + loss_ls) / 2
+        #     loss_al = F.cross_entropy(a_similarity, labels)
+        #     loss_la = F.cross_entropy(a_similarity.T, labels)
+        #     loss_a = (loss_al + loss_la) / 2
+        #     self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
+        #     self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
@@ -369,7 +379,6 @@ class PPO(OnPolicyAlgorithm):
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> SelfPPO:
-        print(self.policy)
         # total_params = sum(param.numel() for param in self.policy.action_net.parameters() if param.requires_grad)
         # print(f"Total trainable parameters: {total_params}")
         # exit()
