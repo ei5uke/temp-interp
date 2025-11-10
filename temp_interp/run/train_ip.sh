@@ -2,13 +2,13 @@
 module load conda
 conda activate temp-interp
 export OMP_NUM_THREADS=1
+curr_user=$(whoami)
 # export MKL_NUM_THREADS=1
 # export CUDA_VISIBLE_DEVICES=1
 
 python -m temp_interp.run.train \
   --env_name cart \
   --num_envs 2 \
-  --policy_type ddt \
   --seed 0 \
   --num_leaves 2 \
   --n_steps 2048 \
@@ -22,7 +22,7 @@ python -m temp_interp.run.train \
   --min_reward 900 \
   --training_steps 2000000 \
   --log_interval 1 \
-  --save_path /scratch/gilbreth/hirota/temp-interp/temp_interp/run/logs/ip/ \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ip/ \
   --use_individual_alpha \
   --argmax_tau 1.0 \
   --hard_node \

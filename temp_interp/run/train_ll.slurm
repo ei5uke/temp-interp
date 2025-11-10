@@ -20,7 +20,6 @@ curr_user=$(whoami)
 python -m temp_interp.run.train \
   --env_name lunar \
   --num_envs 32 \
-  --policy_type ddt \
   --seed 0 \
   --num_leaves 8 \
   --n_steps 2048 \
