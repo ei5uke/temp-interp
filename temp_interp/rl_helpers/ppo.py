@@ -333,7 +333,6 @@ class PPO(OnPolicyAlgorithm):
 
         with th.no_grad():
             # estimate policy complexity
-            print(obs_batch)
             s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
             a_proj = F.normalize(self.action_proj(action_batch), dim=1)
             similarity = th.matmul(s_proj, a_proj.T) / temp
