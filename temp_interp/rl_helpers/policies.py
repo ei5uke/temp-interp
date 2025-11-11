@@ -75,7 +75,8 @@ class ICCTPolicy(BasePolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         ddt_kwargs: Dict[str, Any] = None,
-        time_horizon: int = 3
+        time_horizon: int = 3,
+        decay: float = 0.5
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -105,9 +106,11 @@ class ICCTPolicy(BasePolicy):
         self.action_dim = get_action_dim(self.action_space)
         self.ddt_kwargs = ddt_kwargs
         self.rpo_alpha = 0.5 # Robust Policy Optimization addition
-        self.time_horizon = time_horizon
+        self.time_horizon = time_horizon # action chunking addition
         self.past_actions = deque(maxlen=self.time_horizon)
         self.past_log_probs = deque(maxlen=self.time_horizon)
+        self.exponential_weighting = th.pow(decay, th.arange(self.time_horizon)).flip(dims=[0])
+        self.exponential_weighting = self.exponential_weighting / th.sum(self.exponential_weighting)
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
@@ -334,6 +337,12 @@ class ICCTPolicy(BasePolicy):
             time_indices,               # time_step dimension (reversed)
             :                           # all environments
         ]
+        ### linear weighted mean
+        # return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
+        ### reverse-exponential weighted mean
+        weights = self.exponential_weighting[self.time_horizon - selected_actions.shape[0]:].to(self.device)
+        selected_actions = selected_actions * weights.reshape(-1, 1, 1)
+        selected_logs = selected_logs * weights.reshape(-1, 1)
         return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
