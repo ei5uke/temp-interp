@@ -8,14 +8,13 @@ curr_user=$(whoami)
 
 python -m temp_interp.run.train \
   --env_name lunar \
-  --num_envs 32 \
-  --seed 0 \
   --num_envs 2\
+  --seed 0 \
   --num_leaves 8 \
-  --n_steps 2048 \
+  --n_steps 3 \
   --lr 5e-4 \
   --ddt_lr 5e-4 \
-  --batch_size 256 \
+  --batch_size 2 \
   --gamma 0.99 \
   --ent-coef 0.0 \
   --clip-range 0.2 \
@@ -28,4 +27,4 @@ python -m temp_interp.run.train \
   --argmax_tau 1.0 \
   --sparse_submodel_type 0 \
   --num_sub_features 2 \
-  | tee temp_interp/run/logs/train_ll_lr-5e-4.log
+  | tee temp_interp/run/logs/ll/complete_lr-5e-4_seed-0.log
