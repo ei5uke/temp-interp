@@ -445,7 +445,7 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
-        zero_mask = ((actions==0)[:, ::2]*1.0).to(self.device)
+        zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
         log_prob = distribution.distribution.log_prob(actions).reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=-1)
         log_prob = (log_prob * zero_mask * self.exponential_weighting.flip([0]).to(self.device)).sum(dim=1)
         entropy = distribution.entropy()
