@@ -318,6 +318,7 @@ class PPO(OnPolicyAlgorithm):
 
         entropy_losses = []
         pg_losses, value_losses = [], []
+        ratios = []
         clip_fractions = []
 
         continue_training = True
@@ -370,6 +371,7 @@ class PPO(OnPolicyAlgorithm):
 
                 # Logging
                 pg_losses.append(policy_loss.item())
+                ratios.append(ratio.mean().item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
 
@@ -460,6 +462,7 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/ratios", np.mean(ratios))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
