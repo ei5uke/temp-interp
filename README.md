@@ -29,14 +29,19 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 ### Overall
 - [x] Add PPO w/ ICCT ~~(one thing to note is that the policy gradient loss is really low)~~
     - (Oct 20, 2025) performed experiments (IP, LL, LK) with results matching SAC in original paper.
-- [x] Add PPO w/ ICCT + Action Chunking
-    - ~~(Nov 11, 2025) implemented but results are not equal~~
-    - (Nov 12, 2025) fixed issues, LL performance match results
+- [ ] Action Chunking w/ Temporal Ensemble
+    - [x] Add PPO w/ ICCT + Action Chunking
+        - ~~(Nov 11, 2025) implemented but results are not equal~~
+        - (Nov 12, 2025) fixed issues, LL performance match results
+    - [ ] The same ^ but for MLPs
+        - (Nov 13, 2025) implemented, now testing
+- [ ] Action Chunking w/ Temporal Prediction
 - [x] Add InfoNCE within PPO `learn()`
     - (Oct 28, 2025) infobottleneck with the leaf probabilities
     - (Oct 28, 2025) add policy complexity analysis
 
 ### Known bugs
+- [ ] (Nov 12, 2025) with the addition of action chunking and MLP, infonce stuff doesn't work
 - [ ] (Nov 10, 2025) LaneKeeping is now outputting dictionary observations; 
 - [ ] (Nov 10, 2025) InvertedPendulum expects different action dim
 - [ ] sumo_envs probably do not work with current python/torch version
