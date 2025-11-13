@@ -1,6 +1,6 @@
 # references: https://github.com/DLR-RM/stable-baselines3/blob/master/stable_baselines3/ppo/ppo.py
 # and https://github.com/CORE-Robotics-Lab/ICCT/blob/a7887bfd824a86381599dc576b9e4c0aeac61092/icct/rl_helpers/sac.py
-# modified PPO to include DDT/ICCT training.
+# modified PPO to include action chunking training.
 
 import warnings
 from typing import Any, ClassVar, Optional, TypeVar, Union
@@ -19,7 +19,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.preprocessing import get_action_dim
 
-from temp_interp.rl_helpers.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy, ICCTPolicy
+from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy, MLPPolicy
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -34,7 +34,7 @@ class PPO(OnPolicyAlgorithm):
 
     Introduction to PPO: https://spinningup.openai.com/en/latest/algorithms/ppo.html
 
-    :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
+    :param policy: The policy model to use (ICCTPolicy, MLPPolicy, ...)
     :param env: The environment to learn from (if registered in Gym, can be str)
     :param learning_rate: The learning rate, it can be a function
         of the current progress remaining (from 1 to 0)
@@ -80,15 +80,13 @@ class PPO(OnPolicyAlgorithm):
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
-        "MlpPolicy": ActorCriticPolicy,
-        "CnnPolicy": ActorCriticCnnPolicy,
-        "MultiInputPolicy": MultiInputActorCriticPolicy,
         "ICCTPolicy": ICCTPolicy,
+        "MLPPolicy": MLPPolicy,
     }
 
     def __init__(
         self,
-        policy: Union[str, type[ActorCriticPolicy]],
+        policy: Union[str, type[MLPPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
@@ -182,12 +180,11 @@ class PPO(OnPolicyAlgorithm):
             self._setup_model()
 
         # project actions, states, and leaf probabilities to the same dimension
-        # self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
-        self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
-        self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
-        self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
-        # self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device) # action itself, not the chunk
-        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+        # self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+        # self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
+        # self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
+        # # self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device) # action itself, not the chunk
+        # self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
 
         # only add if we are storing the flattened action to the buffer instead 
         # of the temporal ensemble action
@@ -338,8 +335,9 @@ class PPO(OnPolicyAlgorithm):
                 values = values.flatten()
 
                 # DDT addition
-                if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
-                    attn = self.policy.action_net.leaf_attn.repeat_interleave(2)
+                if type(self.policy) is ICCTPolicy:
+                    if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
+                        attn = self.policy.action_net.leaf_attn.repeat_interleave(2)
 
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -356,18 +354,19 @@ class PPO(OnPolicyAlgorithm):
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
 
                 # DDT addition
-                if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
-                    l1_reg_loss = 0
-                    if self.policy.action_net_kwargs['l1_reg_bias']:
-                        for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
-                            l1_reg_loss += th.sum(abs(p)) * attn[i]
-                    else:
-                        for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
-                            if not 'bias' in name:
+                if type(self.policy) is ICCTPolicy:
+                    if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
+                        l1_reg_loss = 0
+                        if self.policy.action_net_kwargs['l1_reg_bias']:
+                            for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
                                 l1_reg_loss += th.sum(abs(p)) * attn[i]
-                    l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
-                    l1_reg_losses.append(l1_reg_loss.item())
-                    policy_loss += l1_reg_loss
+                        else:
+                            for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
+                                if not 'bias' in name:
+                                    l1_reg_loss += th.sum(abs(p)) * attn[i]
+                        l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
+                        l1_reg_losses.append(l1_reg_loss.item())
+                        policy_loss += l1_reg_loss
 
                 # Logging
                 pg_losses.append(policy_loss.item())
@@ -427,36 +426,35 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        ### mutual information (mi) analysis
-        mi_batch_size = self.batch_size
-        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
-        obs_batch = mi_batch.observations
-        action_batch = mi_batch.actions
-        temp = 0.1
-
-        with th.no_grad():
-            # estimate policy complexity
-            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
-            a_proj = F.normalize(self.action_proj(action_batch), dim=1)
-            similarity = th.matmul(s_proj, a_proj.T) / temp
-            labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
-            loss_sa = F.cross_entropy(similarity, labels)
-            loss_as = F.cross_entropy(similarity.T, labels)
-            loss_pc = (loss_sa + loss_as) / 2
-            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss_pc.cpu().item())
-            # information bottleneck no layers
-            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-            s_similarity = th.matmul(s_proj, l_proj.T) / temp
-            a_similarity = th.matmul(a_proj, l_proj.T) / temp
-            loss_sl = F.cross_entropy(s_similarity, labels)
-            loss_ls = F.cross_entropy(s_similarity.T, labels)
-            loss_s = (loss_sl + loss_ls) / 2
-            loss_al = F.cross_entropy(a_similarity, labels)
-            loss_la = F.cross_entropy(a_similarity.T, labels)
-            loss_a = (loss_al + loss_la) / 2
-            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
-            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
+        # ### mutual information (mi) analysis
+        # mi_batch_size = self.batch_size
+        # mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        # obs_batch = mi_batch.observations
+        # action_batch = mi_batch.actions
+        # temp = 0.1
+        # with th.no_grad():
+        #     # estimate policy complexity
+        #     s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+        #     a_proj = F.normalize(self.action_proj(action_batch), dim=1)
+        #     similarity = th.matmul(s_proj, a_proj.T) / temp
+        #     labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
+        #     loss_sa = F.cross_entropy(similarity, labels)
+        #     loss_as = F.cross_entropy(similarity.T, labels)
+        #     loss_pc = (loss_sa + loss_as) / 2
+        #     self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss_pc.cpu().item())
+        #     # information bottleneck no layers
+        #     leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+        #     l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+        #     s_similarity = th.matmul(s_proj, l_proj.T) / temp
+        #     a_similarity = th.matmul(a_proj, l_proj.T) / temp
+        #     loss_sl = F.cross_entropy(s_similarity, labels)
+        #     loss_ls = F.cross_entropy(s_similarity.T, labels)
+        #     loss_s = (loss_sl + loss_ls) / 2
+        #     loss_al = F.cross_entropy(a_similarity, labels)
+        #     loss_la = F.cross_entropy(a_similarity.T, labels)
+        #     loss_a = (loss_al + loss_la) / 2
+        #     self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
+        #     self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
