@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=1
 echo "Running ICCT-complete with Action Chunking with seed ${SEED}"
 curr_user=$(whoami)
 # Base command
-CMD="python -m temp_interp.run.train \
+python -m temp_interp.run.train \
   --env_name lunar \
   --num_envs 32 \
   --seed ${SEED} \
@@ -39,7 +39,7 @@ CMD="python -m temp_interp.run.train \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
-  --argmax_tau 1.0"
+  --argmax_tau 1.0
 
 # Modify based on method
 # if [ "${METHOD}" = "M1" ]; then
@@ -55,5 +55,5 @@ CMD="python -m temp_interp.run.train \
 # fi
 
 # Execute
-eval $CMD
+# eval $CMD
 
