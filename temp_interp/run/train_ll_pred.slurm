@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=MLP-TE
-#SBATCH --output=temp_interp/run/logs/ll/mlp_seed-0.log
+#SBATCH --job-name=temp-pred
+#SBATCH --output=temp_interp/run/logs/ll/pred_seed-0.log
 #SBATCH --cpus-per-task=1
 #SBATCH --time=12:00:00
 #SBATCH --account=rpaleja
@@ -17,7 +17,7 @@ curr_user=$(whoami)
 # export MKL_NUM_THREADS=1
 # export CUDA_VISIBLE_DEVICES=1
 
-python -m temp_interp.run.train_mlp \
+python -m temp_interp.run.train_pred \
   --env_name lunar \
   --num_envs 32\
   --seed 0 \
