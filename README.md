@@ -33,9 +33,11 @@ sbatch temp_interp/run/train_{environment_name}.slurm
     - [x] Add PPO w/ ICCT + Action Chunking
         - ~~(Nov 11, 2025) implemented but results are not equal~~
         - (Nov 12, 2025) fixed issues, LL performance match results
-    - [ ] The same ^ but for MLPs
-        - (Nov 13, 2025) implemented, now testing
-- [ ] Action Chunking w/ Temporal Prediction
+    - [x] The same ^ but for MLPs
+        - ~~(Nov 13, 2025) implemented, now testing~~
+        - (Nov 15, 2025) similar performance to DDTs, but more parameters. Should in future test with sparse MLPs
+- [x] Action Chunking w/ Temporal Prediction
+        - (Nov 17, 2025) implemented, now testing with a basic linear schedule and no curriculum
 - [x] Add InfoNCE within PPO `learn()`
     - (Oct 28, 2025) infobottleneck with the leaf probabilities
     - (Oct 28, 2025) add policy complexity analysis
