@@ -11,7 +11,6 @@ from collections import deque, defaultdict
 from gymnasium import spaces
 from torch.nn import functional as F
 
-from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
@@ -19,7 +18,8 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.preprocessing import get_action_dim
 
-from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy, MLPPolicy
+from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy
+from temp_interp.rl_helpers.buffers import TemporalRolloutBuffer
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -81,12 +81,11 @@ class PPO(OnPolicyAlgorithm):
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "ICCTPolicy": ICCTPolicy,
-        "MLPPolicy": MLPPolicy,
     }
 
     def __init__(
         self,
-        policy: Union[str, type[MLPPolicy]],
+        policy: Union[str, type[ICCTPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
@@ -102,7 +101,7 @@ class PPO(OnPolicyAlgorithm):
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
-        rollout_buffer_class: Optional[type[RolloutBuffer]] = None,
+        rollout_buffer_class: Optional[type[TemporalRolloutBuffer]] = TemporalRolloutBuffer,
         rollout_buffer_kwargs: Optional[dict[str, Any]] = None,
         target_kl: Optional[float] = None,
         stats_window_size: int = 100,
@@ -112,7 +111,9 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        time_horizon: int = 3
+        time_horizon: int = 3,
+        method: str = 'pred',
+        curriculum_coef: Union[float, Schedule] = 1.0,
     ):
         super().__init__(
             policy,
@@ -162,7 +163,7 @@ class PPO(OnPolicyAlgorithm):
             if buffer_size % batch_size > 0:
                 warnings.warn(
                     f"You have specified a mini-batch size of {batch_size},"
-                    f" but because the `RolloutBuffer` is of size `n_steps * n_envs = {buffer_size}`,"
+                    f" but because the `TemporalRolloutBuffer` is of size `n_steps * n_envs = {buffer_size}`,"
                     f" after every {untruncated_batches} untruncated mini-batches,"
                     f" there will be a truncated mini-batch of size {buffer_size % batch_size}\n"
                     f"We recommend using a `batch_size` that is a factor of `n_steps * n_envs`.\n"
@@ -175,6 +176,8 @@ class PPO(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
         self.time_horizon = time_horizon
+        self.method = method
+        self.curriculum_coef = curriculum_coef
 
         if _init_setup_model:
             self._setup_model()
@@ -189,6 +192,7 @@ class PPO(OnPolicyAlgorithm):
         # only add if we are storing the flattened action to the buffer instead 
         # of the temporal ensemble action
         self.rollout_buffer.action_dim = self.policy.action_dim
+        self.rollout_buffer.og_action_dim = self.policy.og_action_dim
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -205,13 +209,13 @@ class PPO(OnPolicyAlgorithm):
         self,
         env: VecEnv,
         callback: BaseCallback,
-        rollout_buffer: RolloutBuffer,
+        rollout_buffer: TemporalRolloutBuffer,
         n_rollout_steps: int,
     ) -> bool:
         """
         Clear policy's past information, then collect rollouts
         """
-        self.policy.clear_lists()
+        # self.policy.clear_lists()
 
         assert self._last_obs is not None, "No previous observation was provided"
         # Switch to eval mode (this affects batch norm / dropout)
@@ -233,7 +237,7 @@ class PPO(OnPolicyAlgorithm):
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                actions, values, log_probs, flattened_actions = self.policy(obs_tensor)
+                actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -247,7 +251,9 @@ class PPO(OnPolicyAlgorithm):
                 else:
                     # Otherwise, clip the actions to avoid out of bound error
                     # as we are sampling from an unbounded Gaussian distribution
-                    clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+                    clipped_actions = np.clip(actions, np.repeat(self.action_space.low, self.policy.action_dim // 
+                        self.policy.og_action_dim), np.repeat(self.action_space.high, self.policy.action_dim // 
+                        self.policy.og_action_dim))
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
@@ -280,8 +286,7 @@ class PPO(OnPolicyAlgorithm):
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
-                # actions,
-                flattened_actions.cpu(),
+                actions,
                 rewards,
                 self._last_episode_starts,  # type: ignore[arg-type]
                 values,
@@ -312,16 +317,18 @@ class PPO(OnPolicyAlgorithm):
         # Optional: clip range for the value function
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
+        # Update curriculum coefficient
+        # lamb = self.curriculum_coef(self._current_progress_remaining)
 
         entropy_losses = []
-        pg_losses, value_losses = [], []
+        pg_losses, pred_losses, value_losses = [], [], []
         ratios = []
         clip_fractions = []
 
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
-            approx_kl_divs = []
+            # approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
 
@@ -346,12 +353,23 @@ class PPO(OnPolicyAlgorithm):
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
+                old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
+                ratio = th.exp(log_prob[:, :self.policy.og_action_dim].sum(dim=1) - old_log_prob)
 
                 # clipped surrogate loss
                 policy_loss_1 = advantages * ratio
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+                # temporal prediction loss 
+                curr_action = rollout_data.actions.clone()
+                curr_action[:] = curr_action[:, :self.policy.og_action_dim].repeat(1, self.time_horizon)
+                _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
+                    curr_action.repeat_interleave(self.time_horizon - 1, dim=0))
+                pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.time_horizon, self.policy.og_action_dim).sum(dim=-1)
+                idcs = th.tensor(th.arange(self.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size)
+                pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.time_horizon - 1)
+                temp_pred_loss = -pred_log_prob.sum(dim=1).mean()
 
                 # DDT addition
                 if type(self.policy) is ICCTPolicy:
@@ -370,6 +388,7 @@ class PPO(OnPolicyAlgorithm):
 
                 # Logging
                 pg_losses.append(policy_loss.item())
+                pred_losses.append(temp_pred_loss.item())
                 ratios.append(ratio.mean().item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
@@ -396,22 +415,22 @@ class PPO(OnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                # loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                loss = policy_loss + 0.5 * temp_pred_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
-                with th.no_grad():
-                    log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
-                    approx_kl_divs.append(approx_kl_div)
-
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
-                    continue_training = False
-                    if self.verbose >= 1:
-                        print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
-                    break
+                # with th.no_grad():
+                #     log_ratio = log_prob - rollout_data.old_log_prob
+                #     approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                #     approx_kl_divs.append(approx_kl_div)
+                # if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                #     continue_training = False
+                #     if self.verbose >= 1:
+                #         print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
+                #     break
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
@@ -459,9 +478,10 @@ class PPO(OnPolicyAlgorithm):
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/pred_loss", np.mean(pred_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
         self.logger.record("train/ratios", np.mean(ratios))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
