@@ -116,14 +116,14 @@ class EpCheckPointCallback(EvalCallback):
             if mean_reward > self.best_mean_reward:
                 if self.verbose > 0:
                     print("New best mean reward!")
-                if self.best_model_save_path is not None:
-                    self.model.save(os.path.join(self.best_model_save_path, "best_model"))
+                # if self.best_model_save_path is not None:
+                #     self.model.save(os.path.join(self.best_model_save_path, "best_model"))
                 self.best_mean_reward = mean_reward
                 # Trigger callback if needed
                 if self.callback is not None:
                     return self._on_event()
-            if mean_reward > self.minimum_reward:
-                if self.best_model_save_path is not None:
-                    self.model.save(os.path.join(self.best_model_save_path, f"callback_{self.n_calls}"))
+            # if mean_reward > self.minimum_reward:
+            #     if self.best_model_save_path is not None:
+            #         self.model.save(os.path.join(self.best_model_save_path, f"callback_{self.n_calls}"))
 
         return True
