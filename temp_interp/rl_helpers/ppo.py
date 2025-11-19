@@ -254,6 +254,8 @@ class PPO(OnPolicyAlgorithm):
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
+            # print("New Obs: ", new_obs.keys())
+
             self.num_timesteps += env.num_envs
 
             # Give access to local variables
@@ -431,6 +433,8 @@ class PPO(OnPolicyAlgorithm):
         mi_batch_size = self.batch_size
         mi_batch = next(self.rollout_buffer.get(mi_batch_size))
         obs_batch = mi_batch.observations
+
+        # print("OBS: ", obs_batch)
         action_batch = mi_batch.actions
         temp = 0.1
 

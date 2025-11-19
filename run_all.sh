@@ -7,6 +7,9 @@ for SEED in 0 1 2 3; do
   sbatch --export=ALL,SEED=$SEED temp_interp/run/train_ip_all.slurm
 done
 
+for SEED in 0 1 2 3; do
+  sbatch --export=ALL,SEED=$SEED temp_interp/run/train_ik_all.slurm
+done
 
 
 # # For M2 (CDDT-Controllers)
