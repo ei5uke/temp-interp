@@ -4,10 +4,11 @@ from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 import os
 from typing import Any, Callable, Dict, List, Optional, Union
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, sync_envs_normalization
-from stable_baselines3.common.evaluation import evaluate_policy
+# from stable_baselines3.common.evaluation import evaluate_policy
 import gymnasium as gym
 import numpy as np
 import warnings
+from temp_interp.rl_helpers.evaluation import evaluate_policy
 
 class EpCheckPointCallback(EvalCallback):
     """
@@ -66,7 +67,7 @@ class EpCheckPointCallback(EvalCallback):
             # Reset success rate buffer
             self._is_success_buffer = []
 
-            episode_rewards, episode_lengths = evaluate_policy(
+            episode_rewards, episode_lengths, episode_pred_error = evaluate_policy(
                 self.model,
                 self.eval_env,
                 n_eval_episodes=self.n_eval_episodes,
@@ -88,16 +89,17 @@ class EpCheckPointCallback(EvalCallback):
                     self.evaluations_successes.append(self._is_success_buffer)
                     kwargs = dict(successes=self.evaluations_successes)
 
-                np.savez(
-                    self.log_path,
-                    timesteps=self.evaluations_timesteps,
-                    results=self.evaluations_results,
-                    ep_lengths=self.evaluations_length,
-                    **kwargs,
-                )
+                # np.savez(
+                #     self.log_path,
+                #     timesteps=self.evaluations_timesteps,
+                #     results=self.evaluations_results,
+                #     ep_lengths=self.evaluations_length,
+                #     **kwargs,
+                # )
 
             mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
             mean_ep_length, std_ep_length = np.mean(episode_lengths), np.std(episode_lengths)
+            mean_pred_error, std_pred_error = np.mean(episode_pred_error), np.std(episode_pred_error)
             self.last_mean_reward = mean_reward
 
             if self.verbose > 0:
@@ -106,6 +108,7 @@ class EpCheckPointCallback(EvalCallback):
             # Add to current Logger
             self.logger.record("eval/mean_reward", float(mean_reward))
             self.logger.record("eval/mean_ep_length", mean_ep_length)
+            self.logger.record("eval/mean_pred_error", mean_pred_error)
 
             if len(self._is_success_buffer) > 0:
                 success_rate = np.mean(self._is_success_buffer)
