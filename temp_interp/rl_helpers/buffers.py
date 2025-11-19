@@ -1,3 +1,6 @@
+# Originally from stablebaselines3
+# modified to return previous action chunks for temporal prediction
+
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Generator
@@ -332,6 +335,8 @@ class TemporalRolloutBuffer(BaseBuffer):
         batch_inds: np.ndarray,
         env: Optional[VecNormalize] = None,
     ) -> TemporalRolloutBufferSamples:
+        # account for timesteps which do not have enough predictions before them so pad with zero vectors
+        # need to adjust the indices for these zero vectors
         num_preds = self.action_dim // self.og_action_dim - 1
         zero_obs = np.zeros((self.n_envs, num_preds, *self.obs_shape))
         concat_obs = np.concat((zero_obs, self.observations.reshape(self.n_envs, -1, *self.obs_shape)), axis=1).reshape(-1, *self.obs_shape)
@@ -340,8 +345,8 @@ class TemporalRolloutBuffer(BaseBuffer):
         tmp_idcs = []
         for idx in batch_inds:
             num_zero_vecs_added = ((idx // (self.buffer_size))+1) * num_preds
-            tmp_idcs.append(idx + num_zero_vecs_added - 2)
-            tmp_idcs.append(idx + num_zero_vecs_added - 1)
+            for t in range(num_preds, 0, -1):
+                tmp_idcs.append(idx + num_zero_vecs_added - t)
         data = (
             self.observations[batch_inds],
             concat_obs[tmp_idcs],
