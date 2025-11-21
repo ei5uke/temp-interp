@@ -1,14 +1,13 @@
-# For M1 (CDDT)
-for SEED in 0 1 2 3; do
+for SEED in 0 1 2; do
   sbatch --export=ALL,SEED=$SEED temp_interp/run/train_ll_all.slurm
 done
 
-for SEED in 0 1 2 3; do
+for SEED in 0 1 2; do
   sbatch --export=ALL,SEED=$SEED temp_interp/run/train_ip_all.slurm
 done
 
-for SEED in 0 1 2 3; do
-  sbatch --export=ALL,SEED=$SEED temp_interp/run/train_ik_all.slurm
+for SEED in 0 1 2; do
+  sbatch --export=ALL,SEED=$SEED temp_interp/run/train_lk_all.slurm
 done
 
 

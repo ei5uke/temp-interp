@@ -129,7 +129,7 @@ if __name__ == "__main__":
             },
             'decay': {
                 'distribution': 'uniform',
-                'min': 0.1,
+                'min': 0.5,
                 'max': 1.0
             },
         }
