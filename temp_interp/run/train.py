@@ -102,105 +102,127 @@ if __name__ == "__main__":
     elif args.env_name == 'figure8': env_id = 'figure8'
     envs = make_vec_env(make_env(env_id, args.gamma), n_envs=args.num_envs)
     envs.seed(seed=args.seed)
-
-    ## wandb setup
-    policy_name = 'ICCTPolicy'
-    run_name = f"{env_id}__{args.seed}__{int(time.time())}"
-    if args.use_wandb:
-        wandb_config = {
-            "policy_type": policy_name,
-            "total_timesteps": args.training_steps,
-            "env_name": env_id,
-        }
-        run = wandb.init(
-            project="temp-interp",
-            config=wandb_config,
-            name=run_name,
-            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
-            monitor_gym=True,  # auto-upload the videos of agents playing the game
-            # save_code=True,  # optional
-        )
-
     eval_env = gym.make(env_id)
     eval_env.reset(seed=args.seed)
-    log_dir = args.save_path
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    
-    if not args.submodels and not args.hard_node:
-        method = 'm1'
-    elif args.submodels and not args.hard_node:
-        method = 'm2'
-        if args.sparse_submodel_type == 1 or args.sparse_submodel_type == 2:
-            raise Exception('Not a method we want to test')
-    elif not args.submodels and args.hard_node:
-        method = 'm3'    
-    else:
-        if args.sparse_submodel_type != 1 and args.sparse_submodel_type != 2:
-            method = 'm4'
-        elif args.sparse_submodel_type == 1:
-            method = 'm5a'
+
+    sweep_config = {
+        'method': 'bayes',
+        'metric': {
+            'name': 'eval/mean_reward', # 'rollout/ep_rew_mean'
+            'goal': 'maximize'
+        },
+        'parameters': {
+            'ddt_lr': {
+                'distribution': 'uniform',
+                'min': 1e-4,
+                'max': 9e-4
+            },
+            'lr': {
+                'distribution': 'uniform',
+                'min': 1e-4,
+                'max': 9e-4
+            },
+            'clip_range': {
+                'distribution': 'uniform',
+                'min': 0.1,
+                'max': 0.3
+            },
+            'decay': {
+                'distribution': 'uniform',
+                'min': 0.1,
+                'max': 1.0
+            },
+        }
+    }
+
+    def train():
+        ## wandb setup
+        run_name = f"{env_id}__{args.seed}__{int(time.time())}"
+        run = wandb.init(name=run_name, sync_tensorboard=True)
+        config = wandb.config
+
+        log_dir = args.save_path
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        if not args.submodels and not args.hard_node:
+            method = 'm1'
+        elif args.submodels and not args.hard_node:
+            method = 'm2'
+            if args.sparse_submodel_type == 1 or args.sparse_submodel_type == 2:
+                raise Exception('Not a method we want to test')
+        elif not args.submodels and args.hard_node:
+            method = 'm3'    
         else:
-            method = f'm5b_{args.num_sub_features}'
-    
-    eval_monitor_file_path = log_dir + 'eval_' + method + f'_seed{args.seed}'
-    eval_env = Monitor(eval_env, eval_monitor_file_path)
-    callback = EpCheckPointCallback(eval_env=eval_env, best_model_save_path=log_dir, n_eval_episodes=args.n_eval_episodes,
-                                    eval_freq=args.eval_freq, minimum_reward=args.min_reward)
-    if args.use_wandb:
+            if args.sparse_submodel_type != 1 and args.sparse_submodel_type != 2:
+                method = 'm4'
+            elif args.sparse_submodel_type == 1:
+                method = 'm5a'
+            else:
+                method = f'm5b_{args.num_sub_features}'
+        
+        eval_monitor_file_path = log_dir + 'eval_' + method + f'_seed{args.seed}'
+        monitor_eval_env = Monitor(eval_env, eval_monitor_file_path)
+        callback = EpCheckPointCallback(eval_env=monitor_eval_env, best_model_save_path=log_dir, n_eval_episodes=args.n_eval_episodes,
+                                        eval_freq=args.eval_freq, minimum_reward=args.min_reward)
         wandb_callback = WandbCallback(model_save_freq=args.eval_freq, model_save_path=log_dir, verbose=2)
         callback = CallbackList([callback, wandb_callback])
 
-    if args.gpu:
-        args.device = 'cuda'
-    else:
-        args.device = 'cpu'
-        
-    if args.env_name == 'lane_keeping':
-        features_extractor = CombinedExtractor
-    else:
-        features_extractor = FlattenExtractor
+        if args.gpu:
+            args.device = 'cuda'
+        else:
+            args.device = 'cpu'
+            
+        if args.env_name == 'lane_keeping':
+            features_extractor = CombinedExtractor
+        else:
+            features_extractor = FlattenExtractor
 
-    if args.env_name == 'cart':
-        args.fs_submodel_version = 1
-    else:
-        args.fs_submodel_version = 0
+        if args.env_name == 'cart':
+            args.fs_submodel_version = 1
+        else:
+            args.fs_submodel_version = 0
+        
+        ddt_kwargs = {
+            'num_leaves': args.num_leaves,
+            'submodels': args.submodels,
+            'hard_node': args.hard_node,
+            'device': args.device,
+            'argmax_tau': args.argmax_tau,
+            'ddt_lr': config.ddt_lr,
+            'use_individual_alpha': args.use_individual_alpha,
+            'sparse_submodel_type': args.sparse_submodel_type,
+            'fs_submodel_version': args.fs_submodel_version,
+            'l1_reg_coeff': args.l1_reg_coeff,
+            'l1_reg_bias': args.l1_reg_bias,
+            'l1_hard_attn': args.l1_hard_attn,
+            'num_sub_features': args.num_sub_features,
+            'use_gumbel_softmax': args.use_gumbel_softmax,
+            'alg_type': 'ppo'
+        }
+        policy_kwargs = {
+            'features_extractor_class': features_extractor,
+            'ddt_kwargs': ddt_kwargs,
+            'net_arch': {'vf': [64, 64]}, # ICCT uses a qf with [256, 256]; there should be no pi or else a feature_extractor will be made
+            'activation_fn': th.nn.Tanh, # can also test around with th.nn.ReLU
+            'decay': config.decay,
+        }
+        policy_name = 'ICCTPolicy'
+        model = PPO(policy_name, envs,
+                    learning_rate=config.lr,
+                    n_steps=args.n_steps,
+                    batch_size=args.batch_size,
+                    gamma=args.gamma,
+                    ent_coef=args.ent_coef,
+                    clip_range=config.clip_range,
+                    clip_range_vf=args.clip_range_vf,
+                    policy_kwargs=policy_kwargs,
+                    tensorboard_log=log_dir+f"{run.id}",
+                    verbose=1,
+                    device=args.device,
+                    seed=args.seed)
+        model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
+        run.finish()
     
-    ddt_kwargs = {
-        'num_leaves': args.num_leaves,
-        'submodels': args.submodels,
-        'hard_node': args.hard_node,
-        'device': args.device,
-        'argmax_tau': args.argmax_tau,
-        'ddt_lr': args.ddt_lr,
-        'use_individual_alpha': args.use_individual_alpha,
-        'sparse_submodel_type': args.sparse_submodel_type,
-        'fs_submodel_version': args.fs_submodel_version,
-        'l1_reg_coeff': args.l1_reg_coeff,
-        'l1_reg_bias': args.l1_reg_bias,
-        'l1_hard_attn': args.l1_hard_attn,
-        'num_sub_features': args.num_sub_features,
-        'use_gumbel_softmax': args.use_gumbel_softmax,
-        'alg_type': 'ppo'
-    }
-    policy_kwargs = {
-        'features_extractor_class': features_extractor,
-        'ddt_kwargs': ddt_kwargs,
-        'net_arch': {'vf': [64, 64]}, # ICCT uses a qf with [256, 256]; there should be no pi or else a feature_extractor will be made
-        'activation_fn': th.nn.Tanh, # can also test around with th.nn.ReLU
-    }
-    model = PPO(policy_name, envs,
-                learning_rate=args.lr, # OR: linear_schedule(args.lr)
-                n_steps=args.n_steps,
-                batch_size=args.batch_size,
-                ent_coef=args.ent_coef,
-                clip_range=args.clip_range,
-                clip_range_vf=args.clip_range_vf,
-                gamma=args.gamma,
-                policy_kwargs=policy_kwargs,
-                tensorboard_log=log_dir,
-                verbose=1,
-                device=args.device,
-                seed=args.seed)
-    model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
-    if args.use_wandb: run.finish()
+    sweep_id = wandb.sweep(sweep_config, project="temp-interp")
+    wandb.agent(sweep_id, function=train, count=10)

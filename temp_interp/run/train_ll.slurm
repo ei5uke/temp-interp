@@ -2,12 +2,12 @@
 #SBATCH --job-name=DDT-AC
 #SBATCH --output=temp_interp/run/logs/ll/complete_lr-5e-4_seed-0.log
 #SBATCH --cpus-per-task=1
-#SBATCH --time=5:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=rpaleja
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
-#SBATCH --partition=a100-40gb
+#SBATCH --partition=v100
 #SBATCH --mem=32G
 
 module load conda
@@ -31,7 +31,7 @@ python -m temp_interp.run.train \
   --clip-range 0.2 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 10000000 \
+  --training_steps 3000000 \
   --log_interval 1 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
   --use_individual_alpha \

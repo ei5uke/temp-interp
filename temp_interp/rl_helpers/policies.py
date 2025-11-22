@@ -75,7 +75,8 @@ class ICCTPolicy(BasePolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         ddt_kwargs: Dict[str, Any] = None,
-        time_horizon: int = 3
+        time_horizon: int = 3,
+        decay: float = 0.5
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -105,9 +106,11 @@ class ICCTPolicy(BasePolicy):
         self.action_dim = get_action_dim(self.action_space)
         self.ddt_kwargs = ddt_kwargs
         self.rpo_alpha = 0.5 # Robust Policy Optimization addition
-        self.time_horizon = time_horizon
+        self.time_horizon = time_horizon # action chunking addition
         self.past_actions = deque(maxlen=self.time_horizon)
         self.past_log_probs = deque(maxlen=self.time_horizon)
+        self.exponential_weighting = th.pow(decay, th.arange(self.time_horizon)).flip(dims=[0])
+        self.exponential_weighting = self.exponential_weighting / th.sum(self.exponential_weighting)
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
@@ -264,7 +267,14 @@ class ICCTPolicy(BasePolicy):
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=self.ddt_kwargs['ddt_lr'], **self.optimizer_kwargs) # this should probs be ddt_kwargs itself
 
-    def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def clear_lists(self):
+        """
+        Clear past information before each episode collection
+        """
+        self.past_actions = deque(maxlen=self.time_horizon)
+        self.past_log_probs = deque(maxlen=self.time_horizon)
+
+    def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -303,11 +313,10 @@ class ICCTPolicy(BasePolicy):
         # Perform ensemble
         self.past_actions.append(chunked_action)
         self.past_log_probs.append(chunked_log_prob)
-        (ensemble_action, ensemble_log) = self._temporal_ensemble()
+        (ensemble_action, ensemble_log, flattened_actions) = self._temporal_ensemble()
+        return ensemble_action, values, ensemble_log, flattened_actions
 
-        return ensemble_action, values, ensemble_log
-
-    def _temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor]:
+    def _temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Expects a deque/list of actions and log prob in in the following shape:
 
@@ -319,7 +328,7 @@ class ICCTPolicy(BasePolicy):
         """    
 
         stacked_actions = th.stack(list(self.past_actions))
-        n_tensors, _, _, _ = stacked_actions.shape
+        n_tensors, _, n_envs, _ = stacked_actions.shape
         time_indices = th.arange(n_tensors - 1, -1, -1)
 
         selected_actions = stacked_actions[
@@ -334,7 +343,20 @@ class ICCTPolicy(BasePolicy):
             time_indices,               # time_step dimension (reversed)
             :                           # all environments
         ]
-        return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
+        ### linear weighted mean
+        # return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
+
+        ### reverse-exponential weighted mean
+        weights = self.exponential_weighting[self.time_horizon - selected_actions.shape[0]:].to(self.device)
+        scaled_selected_actions = selected_actions * weights.reshape(-1, 1, 1)
+        scaled_selected_logs = selected_logs * weights.reshape(-1, 1)
+
+        ### return the actions used to create the temporal ensemble action
+        flattened_selected_actions = selected_actions.transpose(0, 1).flip([1]).reshape(n_envs, -1)
+        if flattened_selected_actions.shape[1] < self.action_dim:
+            zero_padding = th.zeros(n_envs, self.action_dim - flattened_selected_actions.shape[1])
+            flattened_selected_actions = th.cat((flattened_selected_actions, zero_padding.to(flattened_selected_actions.device)), dim=1)
+        return (scaled_selected_actions.sum(dim=0), scaled_selected_logs.sum(dim=0), flattened_selected_actions)
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -423,9 +445,9 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
-        zero_padding = th.zeros(actions.shape[0], self.action_dim - self.og_action_dim)
-        padded_actions = th.cat((actions, zero_padding.to(actions.device)), dim=-1)
-        log_prob = distribution.distribution.log_prob(padded_actions)[:,:self.action_dim].sum(dim=1)    
+        zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
+        log_prob = distribution.distribution.log_prob(actions).reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=-1)
+        log_prob = (log_prob * zero_mask * self.exponential_weighting.flip([0]).to(self.device)).sum(dim=1)
         entropy = distribution.entropy()
         return values, log_prob, entropy
 

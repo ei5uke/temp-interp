@@ -185,9 +185,13 @@ class PPO(OnPolicyAlgorithm):
         # self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
         self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
         self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
-        # self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
-        self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device) # action itself, not the chunk
+        self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
+        # self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device) # action itself, not the chunk
         self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+
+        # only add if we are storing the flattened action to the buffer instead 
+        # of the temporal ensemble action
+        self.rollout_buffer.action_dim = self.policy.action_dim
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -200,6 +204,103 @@ class PPO(OnPolicyAlgorithm):
 
             self.clip_range_vf = FloatSchedule(self.clip_range_vf)
 
+    def collect_rollouts(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        n_rollout_steps: int,
+    ) -> bool:
+        """
+        Clear policy's past information, then collect rollouts
+        """
+        self.policy.clear_lists()
+
+        assert self._last_obs is not None, "No previous observation was provided"
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(False)
+
+        n_steps = 0
+        rollout_buffer.reset()
+        # Sample new weights for the state dependent exploration
+        if self.use_sde:
+            self.policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        while n_steps < n_rollout_steps:
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.policy.reset_noise(env.num_envs)
+
+            with th.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
+                actions, values, log_probs, flattened_actions = self.policy(obs_tensor)
+            actions = actions.cpu().numpy()
+
+            # Rescale and perform action
+            clipped_actions = actions
+
+            if isinstance(self.action_space, spaces.Box):
+                if self.policy.squash_output:
+                    # Unscale the actions to match env bounds
+                    # if they were previously squashed (scaled in [-1, 1])
+                    clipped_actions = self.policy.unscale_action(clipped_actions)
+                else:
+                    # Otherwise, clip the actions to avoid out of bound error
+                    # as we are sampling from an unbounded Gaussian distribution
+                    clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+            new_obs, rewards, dones, infos = env.step(clipped_actions)
+
+            self.num_timesteps += env.num_envs
+
+            # Give access to local variables
+            callback.update_locals(locals())
+            if not callback.on_step():
+                return False
+
+            self._update_info_buffer(infos, dones)
+            n_steps += 1
+
+            if isinstance(self.action_space, spaces.Discrete):
+                # Reshape in case of discrete action
+                actions = actions.reshape(-1, 1)
+
+            # Handle timeout by bootstrapping with value function
+            # see GitHub issue #633
+            for idx, done in enumerate(dones):
+                if (
+                    done
+                    and infos[idx].get("terminal_observation") is not None
+                    and infos[idx].get("TimeLimit.truncated", False)
+                ):
+                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    with th.no_grad():
+                        terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
+                    rewards[idx] += self.gamma * terminal_value
+
+            rollout_buffer.add(
+                self._last_obs,  # type: ignore[arg-type]
+                # actions,
+                flattened_actions.cpu(),
+                rewards,
+                self._last_episode_starts,  # type: ignore[arg-type]
+                values,
+                log_probs,
+            )
+            self._last_obs = new_obs  # type: ignore[assignment]
+            self._last_episode_starts = dones
+
+        with th.no_grad():
+            # Compute value for the last timestep
+            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+
+        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+        callback.update_locals(locals())
+        callback.on_rollout_end()
+        return True
 
     def train(self) -> None:
         """
@@ -217,6 +318,7 @@ class PPO(OnPolicyAlgorithm):
 
         entropy_losses = []
         pg_losses, value_losses = [], []
+        ratios = []
         clip_fractions = []
 
         continue_training = True
@@ -269,6 +371,7 @@ class PPO(OnPolicyAlgorithm):
 
                 # Logging
                 pg_losses.append(policy_loss.item())
+                ratios.append(ratio.mean().item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
 
@@ -333,15 +436,14 @@ class PPO(OnPolicyAlgorithm):
 
         with th.no_grad():
             # estimate policy complexity
-            print(obs_batch)
             s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
             a_proj = F.normalize(self.action_proj(action_batch), dim=1)
             similarity = th.matmul(s_proj, a_proj.T) / temp
             labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
             loss_sa = F.cross_entropy(similarity, labels)
             loss_as = F.cross_entropy(similarity.T, labels)
-            loss = (loss_sa + loss_as) / 2
-            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss.cpu().item())
+            loss_pc = (loss_sa + loss_as) / 2
+            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss_pc.cpu().item())
             # information bottleneck no layers
             leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
             l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
@@ -360,6 +462,7 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/ratios", np.mean(ratios))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())

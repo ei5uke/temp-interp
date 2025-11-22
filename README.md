@@ -1,7 +1,7 @@
 # Temporal Interpretability [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 Codebase for: "Action Chunking for Temporal Interpretability in Differential Decision Trees"
 
-Authors: Eisuke Hirota, Rohan Paleja
+Authors: Eisuke Hirota, Aarav Sane, Rohan Paleja
 
 ## Installation
 ```
@@ -30,13 +30,15 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 - [x] Add PPO w/ ICCT ~~(one thing to note is that the policy gradient loss is really low)~~
     - (Oct 20, 2025) performed experiments (IP, LL, LK) with results matching SAC in original paper.
 - [x] Add PPO w/ ICCT + Action Chunking
-    - (Nov 11, 2025) implemented but results are not equal
+    - ~~(Nov 11, 2025) implemented but results are not equal~~
+    - (Nov 12, 2025) fixed issues, LL performance match results
 - [x] Add InfoNCE within PPO `learn()`
     - (Oct 28, 2025) infobottleneck with the leaf probabilities
     - (Oct 28, 2025) add policy complexity analysis
 
 ### Known bugs
-- [ ] (Nov 10, 2025) LaneKeeping is now outputting dictionary observations; InvertedPendulum expects different action dim
+- [ ] (Nov 10, 2025) LaneKeeping is now outputting dictionary observations; 
+- [ ] (Nov 10, 2025) InvertedPendulum expects different action dim
 - [ ] sumo_envs probably do not work with current python/torch version
 - [x] `ppo.py`: `self.ent_coef` is equal to `'auto'` when printed. It should not be a str() but rather a float.
     - (Oct 17, 2025) Fixed. Issue was that `'auto'` was being passed to PPO() in `train.py` as a parameter. Change to a float. 
