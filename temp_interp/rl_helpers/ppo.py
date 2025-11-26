@@ -183,11 +183,11 @@ class PPO(OnPolicyAlgorithm):
             self._setup_model()
 
         # project actions, states, and leaf probabilities to the same dimension
-        # self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
-        # self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
-        # self.action_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
-        # # self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device) # action itself, not the chunk
-        # self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+        self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+        self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
+        self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
+        self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
+        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
 
         # only add if we are storing the flattened action to the buffer instead 
         # of the temporal ensemble action
@@ -319,8 +319,9 @@ class PPO(OnPolicyAlgorithm):
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
         # Update curriculum coefficient
         # lamb = self.curriculum_coef(self._current_progress_remaining)
+        # curr_level = 1 + int((1 - self._current_progress_remaining) * self.time_horizon) # 1->0
 
-        entropy_losses = []
+        # entropy_losses = []
         pg_losses, pred_losses, value_losses = [], [], []
         ratios = []
         clip_fractions = []
@@ -361,15 +362,28 @@ class PPO(OnPolicyAlgorithm):
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
 
-                # temporal prediction loss 
+                # temporal prediction loss 1 (log prob)
                 curr_action = rollout_data.actions.clone()
-                curr_action[:] = curr_action[:, :self.policy.og_action_dim].repeat(1, self.time_horizon)
+                curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.time_horizon)
                 _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
                     curr_action.repeat_interleave(self.time_horizon - 1, dim=0))
                 pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.time_horizon, self.policy.og_action_dim).sum(dim=-1)
-                idcs = th.tensor(th.arange(self.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size)
+                idcs = th.tensor(th.arange(self.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
                 pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.time_horizon - 1)
-                temp_pred_loss = -pred_log_prob.sum(dim=1).mean()
+                # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
+                # temp_pred_loss = -pred_log_prob[:, :curr_level].sum(dim=1).mean()
+                temp_pred_loss1 = -pred_log_prob.mean()
+
+                # # temporal prediction loss 2 (MSE)
+                # curr_action = rollout_data.actions.clone()
+                # curr_action = curr_action[:, :self.policy.og_action_dim]
+                # pred_actions, _, _ = self.policy(rollout_data.past_observations) # (n_envs, time_horizon * og_action_dim)
+                # pred_actions = pred_actions.reshape(-1, self.time_horizon, self.policy.og_action_dim) # (n_envs, time_horizon, og_action_dim)
+                # pred_actions = th.gather(pred_actions, 1, idcs.unsqueeze(-1).expand(-1, -1, self.policy.og_action_dim)).squeeze()
+                # temp_pred_loss2 = ((curr_action.repeat(self.time_horizon - 1, 1) - pred_actions)**2).sum(dim=1).mean()
+
+                # temp_pred_loss = temp_pred_loss1 + temp_pred_loss2
+                temp_pred_loss = temp_pred_loss1
 
                 # DDT addition
                 if type(self.policy) is ICCTPolicy:
@@ -407,16 +421,17 @@ class PPO(OnPolicyAlgorithm):
                 value_losses.append(value_loss.item())
 
                 # Entropy loss favor exploration
-                if entropy is None:
-                    # Approximate entropy when no analytical form
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    entropy_loss = -th.mean(entropy)
+                # if entropy is None:
+                #     # Approximate entropy when no analytical form
+                #     entropy_loss = -th.mean(-log_prob)
+                # else:
+                #     entropy_loss = -th.mean(entropy)
 
-                entropy_losses.append(entropy_loss.item())
+                # entropy_losses.append(entropy_loss.item())
 
-                # loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                loss = policy_loss + 0.5 * temp_pred_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                # loss = policy_loss + self.curriculum_coef * temp_pred_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                # loss = policy_loss + (1 - self._current_progress_remaining) * self.curriculum_coef * temp_pred_loss + self.vf_coef * value_loss
+                loss = policy_loss + (1 - self._current_progress_remaining) * temp_pred_loss + self.vf_coef * value_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -443,53 +458,59 @@ class PPO(OnPolicyAlgorithm):
             if not continue_training:
                 break
 
-        explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
+        # explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        # ### mutual information (mi) analysis
-        # mi_batch_size = self.batch_size
-        # mi_batch = next(self.rollout_buffer.get(mi_batch_size))
-        # obs_batch = mi_batch.observations
-        # action_batch = mi_batch.actions
-        # temp = 0.1
-        # with th.no_grad():
-        #     # estimate policy complexity
-        #     s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
-        #     a_proj = F.normalize(self.action_proj(action_batch), dim=1)
-        #     similarity = th.matmul(s_proj, a_proj.T) / temp
-        #     labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal
-        #     loss_sa = F.cross_entropy(similarity, labels)
-        #     loss_as = F.cross_entropy(similarity.T, labels)
-        #     loss_pc = (loss_sa + loss_as) / 2
-        #     self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss_pc.cpu().item())
-        #     # information bottleneck no layers
-        #     leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-        #     l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-        #     s_similarity = th.matmul(s_proj, l_proj.T) / temp
-        #     a_similarity = th.matmul(a_proj, l_proj.T) / temp
-        #     loss_sl = F.cross_entropy(s_similarity, labels)
-        #     loss_ls = F.cross_entropy(s_similarity.T, labels)
-        #     loss_s = (loss_sl + loss_ls) / 2
-        #     loss_al = F.cross_entropy(a_similarity, labels)
-        #     loss_la = F.cross_entropy(a_similarity.T, labels)
-        #     loss_a = (loss_al + loss_la) / 2
-        #     self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
-        #     self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
+        ### mutual information (mi) analysis
+        mi_batch_size = self.batch_size
+        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        obs_batch = mi_batch.observations
+        action_batch = mi_batch.actions
+        temp = 0.1
+        with th.no_grad():
+            # estimate policy complexity, for curr action and action chunk
+            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+            a_proj = F.normalize(self.action_proj(action_batch[:, :self.policy.og_action_dim]), dim=1)
+            ac_proj = F.normalize(self.action_chunk_proj(action_batch), dim=1)
+            similarity_s_a = th.matmul(s_proj, a_proj.T) / temp
+            similarity_s_ac = th.matmul(s_proj, ac_proj.T) / temp
+            labels = th.arange(mi_batch_size).to(similarity_s_a.device)  # positive pairs on diagonal
+            loss_s_a = F.cross_entropy(similarity_s_a, labels)
+            loss_a_s = F.cross_entropy(similarity_s_a.T, labels)
+            loss_s_ac = F.cross_entropy(similarity_s_ac, labels)
+            loss_ac_s = F.cross_entropy(similarity_s_ac.T, labels)
+            loss_pc_a = (loss_s_a + loss_a_s) / 2
+            loss_pc_ac = (loss_s_ac + loss_ac_s) / 2
+            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss_pc_a.cpu().item())
+            self.logger.record(f"train/I(S;AC)", np.log(mi_batch_size) - loss_pc_ac.cpu().item())
+            # information bottleneck no layers
+            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+            s_similarity = th.matmul(s_proj, l_proj.T) / temp
+            a_similarity = th.matmul(ac_proj, l_proj.T) / temp
+            loss_sl = F.cross_entropy(s_similarity, labels)
+            loss_ls = F.cross_entropy(s_similarity.T, labels)
+            loss_s = (loss_sl + loss_ls) / 2
+            loss_al = F.cross_entropy(a_similarity, labels)
+            loss_la = F.cross_entropy(a_similarity.T, labels)
+            loss_a = (loss_al + loss_la) / 2
+            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
+            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
 
         # Logs
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/pred_loss", np.mean(pred_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/ratios", np.mean(ratios))
+        # self.logger.record("train/ratios", np.mean(ratios)) # debugging
         # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        # self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
-        self.logger.record("train/explained_variance", explained_var)
+        # self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/clip_range", clip_range)
+        # self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        # self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
