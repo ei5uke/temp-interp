@@ -76,7 +76,6 @@ class ICCTPolicy(BasePolicy):
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         ddt_kwargs: Dict[str, Any] = None,
         time_horizon: int = 3,
-        decay: float = 0.5
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -107,8 +106,6 @@ class ICCTPolicy(BasePolicy):
         self.ddt_kwargs = ddt_kwargs
         self.rpo_alpha = 0.5 # Robust Policy Optimization addition
         self.time_horizon = time_horizon # action chunking addition
-        self.exponential_weighting = th.pow(decay, th.arange(self.time_horizon)).flip(dims=[0])
-        self.exponential_weighting = self.exponential_weighting / th.sum(self.exponential_weighting)
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
