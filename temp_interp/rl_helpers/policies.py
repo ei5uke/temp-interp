@@ -296,6 +296,8 @@ class ICCTPolicy(BasePolicy):
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
 
+
+        
         # actions shape: [n_envs, extended_action_dim]
         actions = actions.reshape((-1, *self.action_space.shape))  # not sure if necessary
 
@@ -314,6 +316,8 @@ class ICCTPolicy(BasePolicy):
         self.past_actions.append(chunked_action)
         self.past_log_probs.append(chunked_log_prob)
         (ensemble_action, ensemble_log, flattened_actions) = self._temporal_ensemble()
+
+        # print("In FORWARD function: ", ensemble_action)
         return ensemble_action, values, ensemble_log, flattened_actions
 
     def _temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
@@ -445,7 +449,9 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
-        zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
+        # zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
+        actions_reshaped = actions.reshape(-1, self.time_horizon, self.og_action_dim)
+        zero_mask = (actions_reshaped != 0).any(dim=-1).float() 
         log_prob = distribution.distribution.log_prob(actions).reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=-1)
         log_prob = (log_prob * zero_mask * self.exponential_weighting.flip([0]).to(self.device)).sum(dim=1)
         entropy = distribution.entropy()

@@ -254,6 +254,8 @@ class PPO(OnPolicyAlgorithm):
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
+            # print("New Obs: ", new_obs)
+
             self.num_timesteps += env.num_envs
 
             # Give access to local variables
@@ -431,12 +433,30 @@ class PPO(OnPolicyAlgorithm):
         mi_batch_size = self.batch_size
         mi_batch = next(self.rollout_buffer.get(mi_batch_size))
         obs_batch = mi_batch.observations
+        obs_batch_squashed = None
+
+        if isinstance(obs_batch, dict): #specifically for lane keeping env
+        # Each value has shape (batch_size, num_features, 1)
+        # We need to concatenate them into (batch_size, total_features)
+            parts = []
+            for key in sorted(obs_batch.keys()):  # Sort for consistency: derivative, reference_state, state
+                parts.append(obs_batch[key].squeeze(-1))
+            
+            # Concatenate all attributes: (batch_size, 4+4+4) = (batch_size, 12)
+            obs_batch_squashed = th.cat(parts, dim=1)
+            
+            # Ensure it's a tensor
+            if not isinstance(obs_batch_squashed, th.Tensor):
+                obs_batch_squashed = th.FloatTensor(obs_batch_squashed)
+            
+            print(f"Final obs_batch shape: {obs_batch_squashed.shape}")
+
         action_batch = mi_batch.actions
         temp = 0.1
 
         with th.no_grad():
             # estimate policy complexity
-            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+            s_proj = F.normalize(self.state_proj(obs_batch_squashed if obs_batch_squashed is not None else obs_batch), dim=1)  # normalize for cosine similarity
             a_proj = F.normalize(self.action_proj(action_batch), dim=1)
             similarity = th.matmul(s_proj, a_proj.T) / temp
             labels = th.arange(mi_batch_size).to(similarity.device)  # positive pairs on diagonal

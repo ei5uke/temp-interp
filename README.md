@@ -38,7 +38,8 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 
 ### Known bugs
 - [ ] (Nov 10, 2025) LaneKeeping is now outputting dictionary observations; 
-- [ ] (Nov 10, 2025) InvertedPendulum expects different action dim
+- [X] (Nov 10, 2025) InvertedPendulum expects different action dim
+    - (Nov 17, 2025) Fixed. Had to change evaluate actions from stable baselines to only pass in the current timestep action when calling ```env.step(action)```. Also had to change logic for zeroing out certain actions in ```policies.py```
 - [ ] sumo_envs probably do not work with current python/torch version
 - [x] `ppo.py`: `self.ent_coef` is equal to `'auto'` when printed. It should not be a str() but rather a float.
     - (Oct 17, 2025) Fixed. Issue was that `'auto'` was being passed to PPO() in `train.py` as a parameter. Change to a float. 
