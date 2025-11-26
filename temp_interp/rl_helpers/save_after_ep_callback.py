@@ -109,6 +109,7 @@ class EpCheckPointCallback(EvalCallback):
             self.logger.record("eval/mean_reward", float(mean_reward))
             self.logger.record("eval/mean_ep_length", mean_ep_length)
             self.logger.record("eval/mean_pred_error", mean_pred_error)
+            self.logger.record("eval/mean_total", float(mean_reward)-mean_pred_error) # reward - pred_error
 
             if len(self._is_success_buffer) > 0:
                 success_rate = np.mean(self._is_success_buffer)
