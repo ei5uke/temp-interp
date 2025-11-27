@@ -7,12 +7,13 @@ from collections import deque
 
 import gymnasium as gym
 import numpy as np
+import torch as th
 
 from stable_baselines3.common import type_aliases
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecMonitor, is_vecenv_wrapped
 
 
-def evaluate_policy(
+def evaluate_policy_A(
     model: "type_aliases.PolicyPredictor",
     env: Union[gym.Env, VecEnv],
     n_eval_episodes: int = 10,
@@ -81,7 +82,7 @@ def evaluate_policy(
     n_envs = env.num_envs
     episode_rewards = []
     episode_lengths = []
-    episode_pred_error = []
+    if model.policy.abstraction_type == 'temp-pred': episode_pred_error = []
 
     episode_counts = np.zeros(n_envs, dtype="int")
     # Divides episodes among different sub environments in the vector as evenly as possible
@@ -89,29 +90,27 @@ def evaluate_policy(
 
     current_rewards = np.zeros(n_envs)
     current_lengths = np.zeros(n_envs, dtype="int")
-    current_pred_error = np.zeros(n_envs)
+    if model.policy.abstraction_type == 'temp-pred': current_pred_error = np.zeros(n_envs)
     observations = env.reset()
     states = None
     episode_starts = np.ones((env.num_envs,), dtype=bool)
-    prev_chunks = deque(maxlen=model.time_horizon-1)
+    prev_chunks = deque(maxlen=model.policy.time_horizon-1)
+    model.policy.clear_lists() # must clear history or training actions will be added into the ensemble
     while (episode_counts < episode_count_targets).any():
-        actions, states = model.predict(
-            observations,  # type: ignore[arg-type]
-            state=states,
-            episode_start=episode_starts,
-            deterministic=deterministic,
-        )
-        new_observations, rewards, dones, infos = env.step(actions)
-        # here add new action prediction error
-        pred_errors = 0
-        true_action = actions.reshape(n_envs, model.time_horizon, -1)[:, 0, :]
-        for i in range(len(prev_chunks)):
-            chunk = prev_chunks[i]
-            pred_action = chunk.reshape(n_envs, model.time_horizon, -1)[:, model.time_horizon-i-1, :]
-            pred_errors += ((pred_action - true_action)**2).mean(axis=1)
+        output = model.policy(th.tensor(observations), deterministic=deterministic)
+        actions = output[0].detach().numpy()
+        new_observations, rewards, dones, infos = env.step(actions[:, :model.policy.og_action_dim]) # indexing necessary for temp-pred
         current_rewards += rewards
         current_lengths += 1
-        current_pred_error += pred_errors
+        # here add new action prediction error
+        if model.policy.abstraction_type == 'temp-pred':
+            pred_errors = 0
+            true_action = actions.reshape(n_envs, model.policy.time_horizon, -1)[:, 0, :]
+            for i in range(len(prev_chunks)):
+                chunk = prev_chunks[i]
+                pred_action = chunk.reshape(n_envs, model.policy.time_horizon, -1)[:, model.policy.time_horizon-i-1, :]
+                pred_errors += ((pred_action - true_action)**2).mean(axis=1)
+            current_pred_error += pred_errors
         for i in range(n_envs):
             if episode_counts[i] < episode_count_targets[i]:
                 # unpack values so that the callback can access the local variables
@@ -140,10 +139,10 @@ def evaluate_policy(
                         episode_rewards.append(current_rewards[i])
                         episode_lengths.append(current_lengths[i])
                         episode_counts[i] += 1
-                    episode_pred_error.append(current_pred_error[i])
+                    if model.policy.abstraction_type == 'temp-pred': episode_pred_error.append(current_pred_error[i])
                     current_rewards[i] = 0
                     current_lengths[i] = 0
-                    current_pred_error[i] = 0
+                    if model.policy.abstraction_type == 'temp-pred': current_pred_error[i] = 0
 
         observations = new_observations
         prev_chunks.append(actions)
@@ -156,5 +155,8 @@ def evaluate_policy(
     if reward_threshold is not None:
         assert mean_reward > reward_threshold, "Mean reward below threshold: " f"{mean_reward:.2f} < {reward_threshold:.2f}"
     if return_episode_rewards:
-        return episode_rewards, episode_lengths, episode_pred_error
-    return mean_reward, std_reward
+        if model.policy.abstraction_type == 'temp-ensemble':
+            return episode_rewards, episode_lengths, 1 # 1 is a placeholder to ensure same return size. Ideally should return dict instead.
+        elif model.policy.abstraction_type == 'temp-pred':
+            return episode_rewards, episode_lengths, episode_pred_error
+    return mean_reward, std_reward, 1

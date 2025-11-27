@@ -76,6 +76,8 @@ class ICCTPolicy(BasePolicy):
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         ddt_kwargs: Dict[str, Any] = None,
         time_horizon: int = 3,
+        abstraction_type: str = 'temp-pred',
+        decay: float = 0.0,
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -86,7 +88,7 @@ class ICCTPolicy(BasePolicy):
         super().__init__(
             observation_space,
             action_space,
-            features_extractor_class,
+            FlattenExtractor, # We force dicts to flattened np arrays
             features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
@@ -106,6 +108,12 @@ class ICCTPolicy(BasePolicy):
         self.ddt_kwargs = ddt_kwargs
         self.rpo_alpha = 0.5 # Robust Policy Optimization addition
         self.time_horizon = time_horizon # action chunking addition
+        self.abstraction_type = abstraction_type # temp-ensemble or temp-pred
+        if self.abstraction_type == 'temp-ensemble': 
+            self.past_actions = deque(maxlen=self.time_horizon)
+            self.past_log_probs = deque(maxlen=self.time_horizon)
+            self.exponential_weighting = th.pow(decay, th.arange(self.time_horizon)).flip(dims=[0])
+            self.exponential_weighting = self.exponential_weighting / th.sum(self.exponential_weighting)
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
@@ -262,6 +270,13 @@ class ICCTPolicy(BasePolicy):
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=self.ddt_kwargs['ddt_lr'], **self.optimizer_kwargs) # this should probs be ddt_kwargs itself
 
+    def clear_lists(self):
+        """
+        Clear past information before each episode collection
+        """
+        self.past_actions = deque(maxlen=self.time_horizon)
+        self.past_log_probs = deque(maxlen=self.time_horizon)
+
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
@@ -283,8 +298,72 @@ class ICCTPolicy(BasePolicy):
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.distribution.log_prob(actions)
-        return actions, values, log_prob
+
+        if self.abstraction_type == 'temp-ensemble':
+            # actions shape: [n_envs, extended_action_dim]
+            actions = actions.reshape((-1, *self.action_space.shape))  # not sure if necessary
+
+            # log prob shape: [n_envs, extended_action dim]
+            log_prob = distribution.distribution.log_prob(actions)
+
+            #  [n_envs, extended_action_dim] -> [n_envs, chunk_size, orig_action_dim] -> [chunk_size, n_envs, orig_action_dim]
+            chunked_action = actions.reshape(-1, self.time_horizon, self.og_action_dim).transpose(0,1) 
+
+            #  [n_envs, extended_action_dim] -> [n_envs, chunk_size, 1] -> [chunk_size, n_envs]
+            chunked_log_prob = log_prob.reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=2).transpose(0,1) 
+            
+            # Perform ensemble
+            self.past_actions.append(chunked_action)
+            self.past_log_probs.append(chunked_log_prob)
+            (ensemble_action, ensemble_log, flattened_actions) = self._temporal_ensemble()
+
+            # print("In FORWARD function: ", ensemble_action)
+            return ensemble_action, values, ensemble_log, flattened_actions
+        elif self.abstraction_type == 'temp-pred':
+            log_prob = distribution.distribution.log_prob(actions)
+            return actions, values, log_prob
+
+    def _temporal_ensemble(self) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Expects a deque/list of actions and log prob in in the following shape:
+
+        [chunk_size, n_envs, orig_action_dim]
+
+        Aggregates actions across multiple timesteps into one tensor of shape [n_envs, orig_action_dim] which represents an aggregated action for each env at a particular timestep
+
+        Aggregated similarly for log probs but returns a tensor of shape [n_envs] with the aggregated probs across timesteps
+        """    
+
+        stacked_actions = th.stack(list(self.past_actions))
+        n_tensors, _, n_envs, _ = stacked_actions.shape
+        time_indices = th.arange(n_tensors - 1, -1, -1)
+
+        selected_actions = stacked_actions[
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :,                          # all environments
+            :                           # all action dims
+        ]
+        stacked_logs = th.stack(list(self.past_log_probs))
+        selected_logs = stacked_logs[
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :                           # all environments
+        ]
+        ### linear weighted mean
+        # return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
+
+        ### reverse-exponential weighted mean
+        weights = self.exponential_weighting[self.time_horizon - selected_actions.shape[0]:].to(self.device)
+        scaled_selected_actions = selected_actions * weights.reshape(-1, 1, 1)
+        scaled_selected_logs = selected_logs * weights.reshape(-1, 1)
+
+        ### return the actions used to create the temporal ensemble action
+        flattened_selected_actions = selected_actions.transpose(0, 1).flip([1]).reshape(n_envs, -1)
+        if flattened_selected_actions.shape[1] < self.action_dim:
+            zero_padding = th.zeros(n_envs, self.action_dim - flattened_selected_actions.shape[1])
+            flattened_selected_actions = th.cat((flattened_selected_actions, zero_padding.to(flattened_selected_actions.device)), dim=1)
+        return (scaled_selected_actions.sum(dim=0), scaled_selected_logs.sum(dim=0), flattened_selected_actions)
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -373,7 +452,14 @@ class ICCTPolicy(BasePolicy):
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi, actions)
-        log_prob = distribution.distribution.log_prob(actions)
+        if self.abstraction_type == 'temp-ensemble':
+            # zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
+            actions_reshaped = actions.reshape(-1, self.time_horizon, self.og_action_dim)
+            zero_mask = (actions_reshaped != 0).any(dim=-1).float() 
+            log_prob = distribution.distribution.log_prob(actions).reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=-1)
+            log_prob = (log_prob * zero_mask * self.exponential_weighting.flip([0]).to(self.device)).sum(dim=1)
+        elif self.abstraction_type == 'temp-pred':
+            log_prob = distribution.distribution.log_prob(actions)
         entropy = distribution.entropy()
         return values, log_prob, entropy
 

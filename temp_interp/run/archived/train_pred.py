@@ -14,6 +14,7 @@ import numpy as np
 import wandb
 
 from typing import Callable
+import temp_interp.envs.lunar_lander_hard
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.env_util import make_vec_env
@@ -24,18 +25,20 @@ from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
 #### might have issues b/c hpc isn't ubuntu, figure out later
 # from flow.utils.registry import make_create_env
-# from temp_interp.sumo_envs.accel_ring import ring_accel_params
-# from temp_interp.sumo_envs.accel_ring_multilane import ring_accel_lc_params
-# from temp_interp.sumo_envs.accel_figure8 import fig8_params
+# from temp_interp.envs.accel_ring import ring_accel_params
+# from temp_interp.envs.accel_ring_multilane import ring_accel_lc_params
+# from temp_interp.envs.accel_figure8 import fig8_params
 ####
 
-def make_env(env_id, gamma):
+def make_env(env_id, gamma=None):
     def thunk():
         if env_id == 'figure8':
             create_env, _ = make_create_env(params=fig8_params, version=0)
             env = create_env()
+        elif env_id == 'LunarLanderHard': 
+            env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
         else: env = gym.make(env_id)
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        if gamma: env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         return env
     return thunk
 
@@ -97,18 +100,28 @@ if __name__ == "__main__":
     args = parser.parse_args()
     set_random_seed(args.seed) # can add: using_cuda=True
     if args.env_name == 'lunar': env_id = 'LunarLanderContinuous-v3'
+    elif args.env_name == 'lunar-hard': env_id = 'LunarLanderHard'
     elif args.env_name == 'cart': env_id = 'InvertedPendulum-v5' # update to v5 for compatibility
     elif args.env_name == 'lane_keeping': env_id = 'lane-keeping-v0'
     elif args.env_name == 'figure8': env_id = 'figure8'
-    envs = make_vec_env(make_env(env_id, args.gamma), n_envs=args.num_envs)
+    envs = make_vec_env(make_env(env_id, gamma=args.gamma), n_envs=args.num_envs)
     envs.seed(seed=args.seed)
-    eval_env = gym.make(env_id)
+    eval_env = make_env(env_id)()
     eval_env.reset(seed=args.seed)
 
     sweep_config = {
         'method': 'bayes',
         'metric': {
-            'name': 'eval/mean_reward', # 'rollout/ep_rew_mean'
+            # ### general performance sweep
+            # 'name': 'eval/mean_reward', # 'rollout/ep_rew_mean'
+            # 'goal': 'maximize'
+
+            # ### pred loss sweep
+            # 'name': 'eval/mean_pred_error',
+            # 'goal': 'minimize'
+
+            ### total sweep
+            'name': 'eval/mean_total',
             'goal': 'maximize'
         },
         'parameters': {
@@ -127,10 +140,16 @@ if __name__ == "__main__":
                 'min': 0.1,
                 'max': 0.3
             },
-            'decay': {
+            'curriculum_coef': {
                 'distribution': 'uniform',
-                'min': 0.5,
-                'max': 1.0
+                'min': 0.1,
+                'max': 1.0,
+            },
+            'time_horizon': {
+                'values': [10]
+            },
+            'num_leaves': {
+                'values': [8, 16, 18, 20, 22]
             },
         }
     }
@@ -184,7 +203,7 @@ if __name__ == "__main__":
             args.fs_submodel_version = 0
         
         ddt_kwargs = {
-            'num_leaves': args.num_leaves,
+            'num_leaves': config.num_leaves,
             'submodels': args.submodels,
             'hard_node': args.hard_node,
             'device': args.device,
@@ -203,9 +222,9 @@ if __name__ == "__main__":
         policy_kwargs = {
             'features_extractor_class': features_extractor,
             'ddt_kwargs': ddt_kwargs,
-            'net_arch': {'vf': [64, 64]}, # ICCT uses a qf with [256, 256]; there should be no pi or else a feature_extractor will be made
-            'activation_fn': th.nn.Tanh, # can also test around with th.nn.ReLU
-            'decay': config.decay,
+            'net_arch': {'vf': [64, 64]},
+            'activation_fn': th.nn.Tanh,
+            'time_horizon': config.time_horizon,
         }
         policy_name = 'ICCTPolicy'
         model = PPO(policy_name, envs,
@@ -220,9 +239,11 @@ if __name__ == "__main__":
                     tensorboard_log=log_dir+f"{run.id}",
                     verbose=1,
                     device=args.device,
-                    seed=args.seed)
+                    seed=args.seed,
+                    curriculum_coef=config.curriculum_coef,
+                    )
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     
-    sweep_id = wandb.sweep(sweep_config, project="temp-interp")
-    wandb.agent(sweep_id, function=train, count=10)
+    sweep_id = wandb.sweep(sweep_config, project="temp-pred")
+    wandb.agent(sweep_id, function=train, count=5)

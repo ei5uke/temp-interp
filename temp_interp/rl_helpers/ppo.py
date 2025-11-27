@@ -111,7 +111,6 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        time_horizon: int = 3,
         method: str = 'pred',
         curriculum_coef: Union[float, Schedule] = 1.0,
     ):
@@ -175,14 +174,13 @@ class PPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
-        self.time_horizon = time_horizon
         self.method = method
         self.curriculum_coef = curriculum_coef
 
         if _init_setup_model:
             self._setup_model()
 
-        # project actions, states, and leaf probabilities to the same dimension
+        # project actions, states, and leaf probabilities to the same dimension (the average of the dimension spaces)
         self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
         self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
         self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
@@ -193,6 +191,7 @@ class PPO(OnPolicyAlgorithm):
         # of the temporal ensemble action
         self.rollout_buffer.action_dim = self.policy.action_dim
         self.rollout_buffer.og_action_dim = self.policy.og_action_dim
+        if self.policy.abstraction_type == 'temp-pred': self.rollout_buffer.log_prob_dim = self.policy.action_dim 
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -215,7 +214,7 @@ class PPO(OnPolicyAlgorithm):
         """
         Clear policy's past information, then collect rollouts
         """
-        # self.policy.clear_lists()
+        if self.policy.abstraction_type == 'temp-ensemble': self.policy.clear_lists()
 
         assert self._last_obs is not None, "No previous observation was provided"
         # Switch to eval mode (this affects batch norm / dropout)
@@ -237,7 +236,10 @@ class PPO(OnPolicyAlgorithm):
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                actions, values, log_probs = self.policy(obs_tensor)
+                if self.policy.abstraction_type == 'temp-ensemble':
+                    actions, values, log_probs, flattened_actions = self.policy(obs_tensor)
+                elif self.policy.abstraction_type == 'temp-pred':
+                    actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -251,11 +253,16 @@ class PPO(OnPolicyAlgorithm):
                 else:
                     # Otherwise, clip the actions to avoid out of bound error
                     # as we are sampling from an unbounded Gaussian distribution
-                    clipped_actions = np.clip(actions, np.repeat(self.action_space.low, self.policy.action_dim // 
-                        self.policy.og_action_dim), np.repeat(self.action_space.high, self.policy.action_dim // 
-                        self.policy.og_action_dim))
+                    if self.policy.abstraction_type == 'temp-ensemble':
+                        clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+                    elif self.policy.abstraction_type == 'temp-pred':
+                        clipped_actions = np.clip(actions, np.repeat(self.action_space.low, self.policy.action_dim // 
+                            self.policy.og_action_dim), np.repeat(self.action_space.high, self.policy.action_dim // 
+                            self.policy.og_action_dim))[:, :self.policy.og_action_dim]
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+
+            # print("New Obs: ", new_obs)
 
             self.num_timesteps += env.num_envs
 
@@ -286,11 +293,11 @@ class PPO(OnPolicyAlgorithm):
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
-                actions,
+                flattened_actions.cpu() if self.policy.abstraction_type == 'temp-ensemble' else actions,
                 rewards,
                 self._last_episode_starts,  # type: ignore[arg-type]
                 values,
-                log_probs,
+                log_probs.reshape(self.env.num_envs, -1),
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
@@ -319,10 +326,11 @@ class PPO(OnPolicyAlgorithm):
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
         # Update curriculum coefficient
         # lamb = self.curriculum_coef(self._current_progress_remaining)
-        # curr_level = 1 + int((1 - self._current_progress_remaining) * self.time_horizon) # 1->0
+        # curr_level = 1 + int((1 - self._current_progress_remaining) * self.policy.time_horizon) # 1->0
 
-        # entropy_losses = []
-        pg_losses, pred_losses, value_losses = [], [], []
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        if self.policy.abstraction_type == 'temp-pred': pred_losses = []
         ratios = []
         clip_fractions = []
 
@@ -354,36 +362,17 @@ class PPO(OnPolicyAlgorithm):
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # ratio between old and new policy, should be one at the first iteration
-                old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
-                ratio = th.exp(log_prob[:, :self.policy.og_action_dim].sum(dim=1) - old_log_prob)
+                # import ipdb; ipdb.set_trace()
+                if self.policy.abstraction_type == 'temp-ensemble':
+                    ratio = th.exp(log_prob - rollout_data.old_log_prob)
+                elif self.policy.abstraction_type == 'temp-pred':
+                    old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
+                    ratio = th.exp(log_prob[:, :self.policy.og_action_dim].sum(dim=1) - old_log_prob)
 
                 # clipped surrogate loss
                 policy_loss_1 = advantages * ratio
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-                # temporal prediction loss 1 (log prob)
-                curr_action = rollout_data.actions.clone()
-                curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.time_horizon)
-                _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
-                    curr_action.repeat_interleave(self.time_horizon - 1, dim=0))
-                pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.time_horizon, self.policy.og_action_dim).sum(dim=-1)
-                idcs = th.tensor(th.arange(self.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
-                pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.time_horizon - 1)
-                # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
-                # temp_pred_loss = -pred_log_prob[:, :curr_level].sum(dim=1).mean()
-                temp_pred_loss1 = -pred_log_prob.mean()
-
-                # # temporal prediction loss 2 (MSE)
-                # curr_action = rollout_data.actions.clone()
-                # curr_action = curr_action[:, :self.policy.og_action_dim]
-                # pred_actions, _, _ = self.policy(rollout_data.past_observations) # (n_envs, time_horizon * og_action_dim)
-                # pred_actions = pred_actions.reshape(-1, self.time_horizon, self.policy.og_action_dim) # (n_envs, time_horizon, og_action_dim)
-                # pred_actions = th.gather(pred_actions, 1, idcs.unsqueeze(-1).expand(-1, -1, self.policy.og_action_dim)).squeeze()
-                # temp_pred_loss2 = ((curr_action.repeat(self.time_horizon - 1, 1) - pred_actions)**2).sum(dim=1).mean()
-
-                # temp_pred_loss = temp_pred_loss1 + temp_pred_loss2
-                temp_pred_loss = temp_pred_loss1
 
                 # DDT addition
                 if type(self.policy) is ICCTPolicy:
@@ -402,7 +391,6 @@ class PPO(OnPolicyAlgorithm):
 
                 # Logging
                 pg_losses.append(policy_loss.item())
-                pred_losses.append(temp_pred_loss.item())
                 ratios.append(ratio.mean().item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
@@ -421,17 +409,41 @@ class PPO(OnPolicyAlgorithm):
                 value_losses.append(value_loss.item())
 
                 # Entropy loss favor exploration
-                # if entropy is None:
-                #     # Approximate entropy when no analytical form
-                #     entropy_loss = -th.mean(-log_prob)
-                # else:
-                #     entropy_loss = -th.mean(entropy)
+                if entropy is None:
+                    # Approximate entropy when no analytical form
+                    entropy_loss = -th.mean(-log_prob)
+                else:
+                    entropy_loss = -th.mean(entropy)
 
-                # entropy_losses.append(entropy_loss.item())
+                entropy_losses.append(entropy_loss.item())
 
-                # loss = policy_loss + self.curriculum_coef * temp_pred_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                # loss = policy_loss + (1 - self._current_progress_remaining) * self.curriculum_coef * temp_pred_loss + self.vf_coef * value_loss
-                loss = policy_loss + (1 - self._current_progress_remaining) * temp_pred_loss + self.vf_coef * value_loss
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                # temporal loss only if abstraction is temp-pred
+                if self.policy.abstraction_type == 'temp-pred':
+                    # temporal prediction loss 1 (log prob)
+                    curr_action = rollout_data.actions.clone()
+                    curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.policy.time_horizon)
+                    _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
+                        curr_action.repeat_interleave(self.policy.time_horizon - 1, dim=0))
+                    pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.policy.time_horizon, self.policy.og_action_dim).sum(dim=-1)
+                    idcs = th.tensor(th.arange(self.policy.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
+                    pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.policy.time_horizon - 1)
+                    # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
+                    temp_pred_loss1 = -pred_log_prob.mean()
+
+                    # # temporal prediction loss 2 (MSE)
+                    # curr_action = rollout_data.actions.clone()
+                    # curr_action = curr_action[:, :self.policy.og_action_dim]
+                    # pred_actions, _, _ = self.policy(rollout_data.past_observations) # (n_envs, policy.time_horizon * og_action_dim)
+                    # pred_actions = pred_actions.reshape(-1, self.policy.time_horizon, self.policy.og_action_dim) # (n_envs, policy.time_horizon, og_action_dim)
+                    # pred_actions = th.gather(pred_actions, 1, idcs.unsqueeze(-1).expand(-1, -1, self.policy.og_action_dim)).squeeze()
+                    # temp_pred_loss2 = ((curr_action.repeat(self.policy.time_horizon - 1, 1) - pred_actions)**2).sum(dim=1).mean()
+
+                    # temp_pred_loss = temp_pred_loss1 + temp_pred_loss2
+                    temp_pred_loss = temp_pred_loss1
+                    loss = loss + (1 - self._current_progress_remaining) * temp_pred_loss
+                    pred_losses.append(temp_pred_loss.item())
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -461,45 +473,47 @@ class PPO(OnPolicyAlgorithm):
         # explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         ### mutual information (mi) analysis
-        mi_batch_size = self.batch_size
-        mi_batch = next(self.rollout_buffer.get(mi_batch_size))
+        mi_batch = next(self.rollout_buffer.get(self.batch_size))
         obs_batch = mi_batch.observations
+        obs_batch_squashed = None
+
+        # if isinstance(obs_batch, dict): # specifically for lane keeping env
+        # # Each value has shape (batch_size, num_features, 1)
+        # # We need to concatenate them into (batch_size, total_features)
+        #     parts = []
+        #     for key in sorted(obs_batch.keys()):  # Sort for consistency: derivative, reference_state, state
+        #         parts.append(obs_batch[key].squeeze(-1))
+            
+        #     # Concatenate all attributes: (batch_size, 4+4+4) = (batch_size, 12)
+        #     obs_batch_squashed = th.cat(parts, dim=1)
+            
+        #     # Ensure it's a tensor
+        #     if not isinstance(obs_batch_squashed, th.Tensor):
+        #         obs_batch_squashed = th.FloatTensor(obs_batch_squashed)
+            
+        #     print(f"Final obs_batch shape: {obs_batch_squashed.shape}")
+
         action_batch = mi_batch.actions
-        temp = 0.1
         with th.no_grad():
             # estimate policy complexity, for curr action and action chunk
-            s_proj = F.normalize(self.state_proj(obs_batch), dim=1)  # normalize for cosine similarity
+            # s_proj = F.normalize(self.state_proj(obs_batch_squashed.to(th.float32)
+            #     if obs_batch_squashed is not None else obs_batch.to(th.float32)), dim=1)
+            s_proj = F.normalize(self.state_proj(obs_batch.to(th.float32)), dim=1)
             a_proj = F.normalize(self.action_proj(action_batch[:, :self.policy.og_action_dim]), dim=1)
             ac_proj = F.normalize(self.action_chunk_proj(action_batch), dim=1)
-            similarity_s_a = th.matmul(s_proj, a_proj.T) / temp
-            similarity_s_ac = th.matmul(s_proj, ac_proj.T) / temp
-            labels = th.arange(mi_batch_size).to(similarity_s_a.device)  # positive pairs on diagonal
-            loss_s_a = F.cross_entropy(similarity_s_a, labels)
-            loss_a_s = F.cross_entropy(similarity_s_a.T, labels)
-            loss_s_ac = F.cross_entropy(similarity_s_ac, labels)
-            loss_ac_s = F.cross_entropy(similarity_s_ac.T, labels)
-            loss_pc_a = (loss_s_a + loss_a_s) / 2
-            loss_pc_ac = (loss_s_ac + loss_ac_s) / 2
-            self.logger.record(f"train/I(S;A)", np.log(mi_batch_size) - loss_pc_a.cpu().item())
-            self.logger.record(f"train/I(S;AC)", np.log(mi_batch_size) - loss_pc_ac.cpu().item())
+            self.logger.record(f"train/I(S;A)", self._estimate_mutual_info(s_proj, a_proj))
+            self.logger.record(f"train/I(S;AC)", self._estimate_mutual_info(s_proj, ac_proj))
             # information bottleneck no layers
             leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-            l_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-            s_similarity = th.matmul(s_proj, l_proj.T) / temp
-            a_similarity = th.matmul(ac_proj, l_proj.T) / temp
-            loss_sl = F.cross_entropy(s_similarity, labels)
-            loss_ls = F.cross_entropy(s_similarity.T, labels)
-            loss_s = (loss_sl + loss_ls) / 2
-            loss_al = F.cross_entropy(a_similarity, labels)
-            loss_la = F.cross_entropy(a_similarity.T, labels)
-            loss_a = (loss_al + loss_la) / 2
-            self.logger.record(f"train/I(S;T)", np.log(mi_batch_size) - loss_s.cpu().item())
-            self.logger.record(f"train/I(T;A)", np.log(mi_batch_size) - loss_a.cpu().item())
+            t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+            self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
+            self.logger.record(f"train/I(T;A)", self._estimate_mutual_info(t_proj, a_proj))
+            self.logger.record(f"train/I(T;AC)", self._estimate_mutual_info(t_proj, ac_proj))
 
         # Logs
-        # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        self.logger.record("train/pred_loss", np.mean(pred_losses))
+        if self.policy.abstraction_type == 'temp-pred': self.logger.record("train/pred_loss", np.mean(pred_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
         # self.logger.record("train/ratios", np.mean(ratios)) # debugging
         # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
@@ -513,6 +527,17 @@ class PPO(OnPolicyAlgorithm):
         # self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+    def _estimate_mutual_info(self, proj_A, proj_B, temp=0.1):
+        '''
+        Estimate Mutual information using InfoNCELoss.
+        '''
+        labels = th.arange(self.batch_size).to(proj_A.device)  # positive pairs on diagonal
+        similarity = th.matmul(proj_A, proj_B.T) / temp
+        loss_A_B = F.cross_entropy(similarity, labels)
+        loss_B_A = F.cross_entropy(similarity.T, labels)
+        loss = (loss_A_B + loss_B_A) / 2
+        return np.log(self.batch_size) - loss.cpu().item()
 
     def learn(
         self: SelfPPO,
