@@ -44,6 +44,7 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 - [ ] Fix up and merge MLP code
 
 ### Known bugs
+- [ ] (Nov 27, 2025) temporal ensemble is *probably* resetting past actions only at beginning of rollout collect, but it should be doing it before every new episode starts instead.
 - [x] (Nov 12, 2025) with the addition of action chunking and MLP, infonce stuff doesn't work
 - [x] (Nov 10, 2025) LaneKeeping is now outputting dictionary observations; 
 - [X] (Nov 10, 2025) InvertedPendulum expects different action dim
