@@ -362,7 +362,6 @@ class PPO(OnPolicyAlgorithm):
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # ratio between old and new policy, should be one at the first iteration
-                # import ipdb; ipdb.set_trace()
                 if self.policy.abstraction_type == 'temp-ensemble':
                     ratio = th.exp(log_prob - rollout_data.old_log_prob)
                 elif self.policy.abstraction_type == 'temp-pred':
@@ -430,18 +429,7 @@ class PPO(OnPolicyAlgorithm):
                     idcs = th.tensor(th.arange(self.policy.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
                     pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.policy.time_horizon - 1)
                     # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
-                    temp_pred_loss1 = -pred_log_prob.mean()
-
-                    # # temporal prediction loss 2 (MSE)
-                    # curr_action = rollout_data.actions.clone()
-                    # curr_action = curr_action[:, :self.policy.og_action_dim]
-                    # pred_actions, _, _ = self.policy(rollout_data.past_observations) # (n_envs, policy.time_horizon * og_action_dim)
-                    # pred_actions = pred_actions.reshape(-1, self.policy.time_horizon, self.policy.og_action_dim) # (n_envs, policy.time_horizon, og_action_dim)
-                    # pred_actions = th.gather(pred_actions, 1, idcs.unsqueeze(-1).expand(-1, -1, self.policy.og_action_dim)).squeeze()
-                    # temp_pred_loss2 = ((curr_action.repeat(self.policy.time_horizon - 1, 1) - pred_actions)**2).sum(dim=1).mean()
-
-                    # temp_pred_loss = temp_pred_loss1 + temp_pred_loss2
-                    temp_pred_loss = temp_pred_loss1
+                    temp_pred_loss = -pred_log_prob.mean()
                     loss = loss + (1 - self._current_progress_remaining) * temp_pred_loss
                     pred_losses.append(temp_pred_loss.item())
 

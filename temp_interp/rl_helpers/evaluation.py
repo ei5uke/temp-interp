@@ -95,10 +95,10 @@ def evaluate_policy_A(
     states = None
     episode_starts = np.ones((env.num_envs,), dtype=bool)
     prev_chunks = deque(maxlen=model.policy.time_horizon-1)
-    model.policy.clear_lists() # must clear history or training actions will be added into the ensemble
+    if model.policy.abstraction_type == 'temp-ensemble': model.policy.past_eval_actions.clear()
+    device = next(model.policy.parameters()).device
     while (episode_counts < episode_count_targets).any():
-        output = model.policy(th.tensor(observations), deterministic=deterministic)
-        actions = output[0].detach().numpy()
+        actions = model.policy(th.tensor(observations).to(device), deterministic=deterministic).cpu().detach().numpy()
         new_observations, rewards, dones, infos = env.step(actions[:, :model.policy.og_action_dim]) # indexing necessary for temp-pred
         current_rewards += rewards
         current_lengths += 1
