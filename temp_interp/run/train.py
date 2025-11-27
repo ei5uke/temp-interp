@@ -239,5 +239,5 @@ if __name__ == "__main__":
         run.finish()
     
     # sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type)
-    sweep_id = wandb.sweep(sweep_config, project="bugfixing")
+    sweep_id = wandb.sweep(sweep_config, project="merge-test")
     wandb.agent(sweep_id, function=train, count=args.num_search)

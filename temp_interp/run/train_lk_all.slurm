@@ -28,7 +28,7 @@ python -m temp_interp.run.train \
   --ent-coef 0.0 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 10000000 \
+  --training_steps 1000000 \
   --log_interval 1 \
   --gpu \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/lk/ \

@@ -8,15 +8,15 @@ curr_user=$(whoami)
 python -m temp_interp.run.train \
   --env_name cart \
   --abstraction_type temp-ensemble \
-  --num_envs 2 \
+  --num_envs 32 \
   --seed 0 \
-  --n_steps 10 \
-  --batch_size 4 \
+  --n_steps 2048 \
+  --batch_size 256 \
   --gamma 0.99 \
   --ent-coef 0.0 \
   --eval_freq 10 \
   --min_reward 900 \
-  --training_steps 10000000 \
+  --training_steps 2000000 \
   --log_interval 1 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ip/ \
   --use_individual_alpha \

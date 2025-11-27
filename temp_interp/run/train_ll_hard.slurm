@@ -7,18 +7,17 @@
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
-#SBATCH --partition=a100-40gb
+#SBATCH --partition=v100
 #SBATCH --mem=32G
 
 module load conda
 conda activate temp-interp
 export OMP_NUM_THREADS=1
-
-echo "Running ICCT-complete with Action Chunking with seed 0"
 curr_user=$(whoami)
 
 python -m temp_interp.run.train \
   --env_name lunar-hard \
+  --abstraction_type temp-pred \
   --num_envs 32 \
   --seed 0 \
   --n_steps 2048 \
@@ -35,3 +34,4 @@ python -m temp_interp.run.train \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
+  --num_search 5 \
