@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=DDT-AC
-#SBATCH --output=temp_interp/run/logs/ll/complete_lr-5e-4_seeds.log
+#SBATCH --output=temp_interp/run/logs/ll_hard/icct.log
 #SBATCH --cpus-per-task=1
 #SBATCH --time=24:00:00
 #SBATCH --account=rpaleja
@@ -18,7 +18,7 @@ echo "Running ICCT-complete with Action Chunking with seed ${SEED} and method ${
 curr_user=$(whoami)
 
 python -m temp_interp.run.train \
-  --env_name lunar \
+  --env_name lunar-hard \
   --abstraction_type ${METHOD} \
   --num_envs 32 \
   --seed ${SEED} \
@@ -28,10 +28,10 @@ python -m temp_interp.run.train \
   --ent-coef 0.0 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 3000000 \
+  --training_steps 10000000 \
   --log_interval 1 \
   --gpu \
-  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll_hard/ICCTComplete_${SEED} \
   --use_individual_alpha \
   --hard_node \
   --submodels \

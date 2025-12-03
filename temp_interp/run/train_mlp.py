@@ -1,5 +1,5 @@
 # reference: https://github.com/CORE-Robotics-Lab/ICCT/blob/main/icct/runfiles/train.py
-# modified to leverage PPO instead of SAC or TD3, directly apply PPO+ICCTs, and PPO+ICCT+action chunking.
+# modified to leverage PPO instead of SAC or TD3, directly apply to MLPs+PPO+action chunking.
 
 import copy
 import argparse
@@ -39,7 +39,6 @@ def make_env(env_id, gamma=None):
             env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
         else: env = gym.make(env_id)
         if gamma: env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.FlattenObservation(env) # change Dict to nparray
         return env
     return thunk
 
@@ -78,19 +77,6 @@ if __name__ == "__main__":
     parser.add_argument('--clip-range-vf', help='the clip range of the value function, must be tuned depending on the env rewards', type=float, default=None)
     parser.add_argument('--ent-coef', help='the entropy coefficient in PPO', type=float, default=0.1)
     parser.add_argument('--training_steps', help='total steps for training the model', type=int, default=500000)
-    # DDT kwargs
-    parser.add_argument('--num_leaves', help='number of leaves used in ddt (2^n)', type=int, default=16)
-    parser.add_argument('--submodels', help='if use sub-models in ddt', action='store_true', default=False)
-    parser.add_argument('--sparse_submodel_type', help='the type of the sparse submodel, 1 for L1 regularization, 2 for feature selection, other values for not sparse', type=int, default=0)
-    parser.add_argument('--hard_node', help='if use differentiable crispification', action='store_true', default=False)
-    parser.add_argument('--argmax_tau', help='the temperature of the diff_argmax function', type=float, default=1.0)
-    parser.add_argument('--ddt_lr', help='the learning rate of the ddt', type=float, default=3e-4)
-    parser.add_argument('--use_individual_alpha', help='if use different alphas for different nodes', action='store_true', default=False)
-    parser.add_argument('--l1_reg_coeff', help='the coefficient of the l1 regularization when using l1-reg submodels', type=float, default=5e-3)
-    parser.add_argument('--l1_reg_bias', help='if consider biases in the l1 loss when using l1-reg submodels', action='store_true', default=False)
-    parser.add_argument('--l1_hard_attn', help='if only sample one linear controller to perform L1 regularization for each update when using l1-reg submodels', action='store_true', default=False)
-    parser.add_argument('--num_sub_features', help='the number of chosen features for submodels', type=int, default=1)
-    parser.add_argument('--use_gumbel_softmax', help='if use gumble softmax instead of the differentiable argmax proposed in the paper', action='store_true', default=False)
     # evaluation and model saving
     parser.add_argument('--min_reward', help='minimum reward to save the model', type=int)
     parser.add_argument('--save_path', help='the path of saving the model', type=str, default='test')
@@ -98,7 +84,6 @@ if __name__ == "__main__":
     parser.add_argument('--eval_freq', help='evaluation frequence of the model', type=int, default=1500)
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
-    parser.add_argument('--num_search', help='the number of hyperparameter searches', type=int, default=1)
 
     args = parser.parse_args()
     assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
@@ -156,23 +141,7 @@ if __name__ == "__main__":
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
         
-        if not args.submodels and not args.hard_node:
-            method = 'm1'
-        elif args.submodels and not args.hard_node:
-            method = 'm2'
-            if args.sparse_submodel_type == 1 or args.sparse_submodel_type == 2:
-                raise Exception('Not a method we want to test')
-        elif not args.submodels and args.hard_node:
-            method = 'm3'    
-        else:
-            if args.sparse_submodel_type != 1 and args.sparse_submodel_type != 2:
-                method = 'm4'
-            elif args.sparse_submodel_type == 1:
-                method = 'm5a'
-            else:
-                method = f'm5b_{args.num_sub_features}'
-        
-        eval_monitor_file_path = log_dir + 'eval_' + method + f'_seed{args.seed}'
+        eval_monitor_file_path = log_dir + 'eval_mlp_' + f'_seed{args.seed}'
         monitor_eval_env = Monitor(eval_env, eval_monitor_file_path)
         callback = EpCheckPointCallback(eval_env=monitor_eval_env, best_model_save_path=log_dir, n_eval_episodes=args.n_eval_episodes,
                                         eval_freq=args.eval_freq, minimum_reward=args.min_reward)
@@ -193,34 +162,16 @@ if __name__ == "__main__":
             args.fs_submodel_version = 1
         else:
             args.fs_submodel_version = 0
-        
-        ddt_kwargs = {
-            'num_leaves': config.num_leaves,
-            'submodels': args.submodels,
-            'hard_node': args.hard_node,
-            'device': args.device,
-            'argmax_tau': args.argmax_tau,
-            'ddt_lr': config.ddt_lr,
-            'use_individual_alpha': args.use_individual_alpha,
-            'sparse_submodel_type': args.sparse_submodel_type,
-            'fs_submodel_version': args.fs_submodel_version,
-            'l1_reg_coeff': args.l1_reg_coeff,
-            'l1_reg_bias': args.l1_reg_bias,
-            'l1_hard_attn': args.l1_hard_attn,
-            'num_sub_features': args.num_sub_features,
-            'use_gumbel_softmax': args.use_gumbel_softmax,
-            'alg_type': 'ppo'
-        }
+
         policy_kwargs = {
             'features_extractor_class': features_extractor,
             'ddt_kwargs': ddt_kwargs,
             'net_arch': {'vf': [64, 64]},
             'activation_fn': th.nn.Tanh,
             'time_horizon': config.time_horizon,
-            'abstraction_type': args.abstraction_type,
         }
         if args.abstraction_type == 'temp-ensemble': policy_kwargs['decay'] = config.decay
-        policy_name = 'ICCTPolicy'
+        policy_name = 'MLPPolicy'
         model = PPO(policy_name, envs,
                     learning_rate=config.lr,
                     n_steps=args.n_steps,
@@ -238,6 +189,5 @@ if __name__ == "__main__":
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     
-    # sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type)
-    sweep_id = wandb.sweep(sweep_config, project="merge-test")
-    wandb.agent(sweep_id, function=train, count=args.num_search)
+    sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type + 'mlp')
+    wandb.agent(sweep_id, function=train, count=10)

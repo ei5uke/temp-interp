@@ -6,8 +6,8 @@ curr_user=$(whoami)
 # export CUDA_VISIBLE_DEVICES=1
 
 python -m temp_interp.run.train \
-  --env_name lunar \
-  --abstraction_type temp-pred \
+  --env_name lunar-hard \
+  --abstraction_type temp-ensemble \
   --num_envs 4 \
   --seed 0 \
   --n_steps 10 \
@@ -16,9 +16,9 @@ python -m temp_interp.run.train \
   --ent-coef 0.0 \
   --eval_freq 10 \
   --min_reward 225 \
-  --training_steps 3000000 \
+  --training_steps 10000000 \
   --log_interval 1 \
-  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll_hard/ICCTComplete_0 \
   --use_individual_alpha \
   --hard_node \
   --submodels \

@@ -14,6 +14,7 @@ import numpy as np
 import wandb
 
 from typing import Callable
+import temp_interp.envs.lunar_lander_hard
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.env_util import make_vec_env
@@ -22,7 +23,6 @@ from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.torch_layers import CombinedExtractor, FlattenExtractor
 from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
-import temp_interp.envs.lunar_lander_hard
 #### might have issues b/c hpc isn't ubuntu, figure out later
 # from flow.utils.registry import make_create_env
 # from temp_interp.envs.accel_ring import ring_accel_params
@@ -39,7 +39,6 @@ def make_env(env_id, gamma=None):
             env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
         else: env = gym.make(env_id)
         if gamma: env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.FlattenObservation(env) # change Dict to nparray
         return env
     return thunk
 
@@ -68,7 +67,6 @@ if __name__ == "__main__":
     parser.add_argument('--num_envs', help='Number of parallel environments to run', type=int, default=1)
     parser.add_argument('--seed', help='the seed number to use', type=int, default=42)
     # PPO kwargs
-    parser.add_argument('--abstraction_type', help='temp-ensemble or temp-pred', default=None)
     parser.add_argument('--gpu', help='if run on a GPU', action='store_true', default=False)
     parser.add_argument('--n_steps', help='Number of steps per batch', type=int, default=2048)
     parser.add_argument('--lr', help='learning rate', type=float, default=3e-4)
@@ -98,10 +96,8 @@ if __name__ == "__main__":
     parser.add_argument('--eval_freq', help='evaluation frequence of the model', type=int, default=1500)
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
-    parser.add_argument('--num_search', help='the number of hyperparameter searches', type=int, default=1)
 
     args = parser.parse_args()
-    assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
     set_random_seed(args.seed) # can add: using_cuda=True
     if args.env_name == 'lunar': env_id = 'LunarLanderContinuous-v3'
     elif args.env_name == 'lunar-hard': env_id = 'LunarLanderHard'
@@ -115,6 +111,19 @@ if __name__ == "__main__":
 
     sweep_config = {
         'method': 'bayes',
+        'metric': {
+            # ### general performance sweep
+            # 'name': 'eval/mean_reward', # 'rollout/ep_rew_mean'
+            # 'goal': 'maximize'
+
+            # ### pred loss sweep
+            # 'name': 'eval/mean_pred_error',
+            # 'goal': 'minimize'
+
+            ### total sweep
+            'name': 'eval/mean_total',
+            'goal': 'maximize'
+        },
         'parameters': {
             'ddt_lr': {
                 'distribution': 'uniform',
@@ -131,20 +140,19 @@ if __name__ == "__main__":
                 'min': 0.1,
                 'max': 0.3
             },
+            'curriculum_coef': {
+                'distribution': 'uniform',
+                'min': 0.1,
+                'max': 1.0,
+            },
             'time_horizon': {
                 'values': [10]
             },
             'num_leaves': {
-                'values': [2, 4, 8, 16, 20]
+                'values': [8, 16, 18, 20, 22]
             },
         }
     }
-    if args.abstraction_type == 'temp-ensemble':
-        sweep_config['metric'] = {'name': 'eval/mean_reward', 'goal': 'maximize'}
-        sweep_config['parameters']['decay'] = {'distribution': 'uniform', 'min': 0.5, 'max': 1.0}
-    elif args.abstraction_type == 'temp-pred':
-        sweep_config['metric'] = {'name': 'eval/mean_total', 'goal': 'maximize'}
-        sweep_config['parameters']['curriculum_coef'] = {'distribution': 'uniform', 'min': 0.1, 'max': 1.0}
 
     def train():
         ## wandb setup
@@ -217,9 +225,7 @@ if __name__ == "__main__":
             'net_arch': {'vf': [64, 64]},
             'activation_fn': th.nn.Tanh,
             'time_horizon': config.time_horizon,
-            'abstraction_type': args.abstraction_type,
         }
-        if args.abstraction_type == 'temp-ensemble': policy_kwargs['decay'] = config.decay
         policy_name = 'ICCTPolicy'
         model = PPO(policy_name, envs,
                     learning_rate=config.lr,
@@ -233,11 +239,11 @@ if __name__ == "__main__":
                     tensorboard_log=log_dir+f"{run.id}",
                     verbose=1,
                     device=args.device,
-                    curriculum_coef=0 if args.abstraction_type == 'temp-ensemble' else config.curriculum_coef,
-                    seed=args.seed)
+                    seed=args.seed,
+                    curriculum_coef=config.curriculum_coef,
+                    )
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     
-    # sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type)
-    sweep_id = wandb.sweep(sweep_config, project="merge-test")
-    wandb.agent(sweep_id, function=train, count=args.num_search)
+    sweep_id = wandb.sweep(sweep_config, project="temp-pred")
+    wandb.agent(sweep_id, function=train, count=5)
