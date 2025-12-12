@@ -186,6 +186,8 @@ class PPO(OnPolicyAlgorithm):
         self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
         self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
         self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+        self.policy_complexities = []
+        self.last_morph_timestep = 0
 
         # only add if we are storing the flattened action to the buffer instead 
         # of the temporal ensemble action
@@ -463,23 +465,7 @@ class PPO(OnPolicyAlgorithm):
         ### mutual information (mi) analysis
         mi_batch = next(self.rollout_buffer.get(self.batch_size))
         obs_batch = mi_batch.observations
-        obs_batch_squashed = None
-
-        # if isinstance(obs_batch, dict): # specifically for lane keeping env
-        # # Each value has shape (batch_size, num_features, 1)
-        # # We need to concatenate them into (batch_size, total_features)
-        #     parts = []
-        #     for key in sorted(obs_batch.keys()):  # Sort for consistency: derivative, reference_state, state
-        #         parts.append(obs_batch[key].squeeze(-1))
-            
-        #     # Concatenate all attributes: (batch_size, 4+4+4) = (batch_size, 12)
-        #     obs_batch_squashed = th.cat(parts, dim=1)
-            
-        #     # Ensure it's a tensor
-        #     if not isinstance(obs_batch_squashed, th.Tensor):
-        #         obs_batch_squashed = th.FloatTensor(obs_batch_squashed)
-            
-        #     print(f"Final obs_batch shape: {obs_batch_squashed.shape}")
+        # obs_batch_squashed = None
 
         action_batch = mi_batch.actions
         with th.no_grad():
@@ -489,7 +475,9 @@ class PPO(OnPolicyAlgorithm):
             s_proj = F.normalize(self.state_proj(obs_batch.to(th.float32)), dim=1)
             a_proj = F.normalize(self.action_proj(action_batch[:, :self.policy.og_action_dim]), dim=1)
             ac_proj = F.normalize(self.action_chunk_proj(action_batch), dim=1)
-            self.logger.record(f"train/I(S;A)", self._estimate_mutual_info(s_proj, a_proj))
+            policy_complexity = self._estimate_mutual_info(s_proj, a_proj)
+            self.policy_complexities.append(policy_complexity)
+            self.logger.record(f"train/I(S;A)", policy_complexity)
             self.logger.record(f"train/I(S;AC)", self._estimate_mutual_info(s_proj, ac_proj))
             # information bottleneck no layers
             leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
@@ -516,6 +504,13 @@ class PPO(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
+        # deepen / prune the tree
+        method = self._check_morph()
+        if method is not None:
+            morph_batch = next(self.rollout_buffer.get(self.batch_size))
+            obs_batch = mi_batch.observations
+            self._morph(obs_batch, method)
+
     def _estimate_mutual_info(self, proj_A, proj_B, temp=0.1):
         '''
         Estimate Mutual information using InfoNCELoss.
@@ -526,6 +521,69 @@ class PPO(OnPolicyAlgorithm):
         loss_B_A = F.cross_entropy(similarity.T, labels)
         loss = (loss_A_B + loss_B_A) / 2
         return np.log(self.batch_size) - loss.cpu().item()
+
+    def _check_morph(self, min_timesteps=1000, epsilon=0.1):
+        '''
+        Check whether we should morph (deepen or prune) the tree. Return whether to deepen or prune if enough timesteps 
+        have passed and if the policy complexities have, on-average, been increasing / decreasing by more than epsilon.
+
+        :param timesteps: the current number of timesteps completed in PPO since the last morph step.
+        :param min_timesteps: the minimum number of timesteps before morph.
+        :param epsilon: the minimum average gradient that must be observed to incentivize morph.
+        '''
+        if self.num_timesteps - self.last_morph_timestep > min_timesteps:
+            trend = np.mean(np.gradient(self.policy_complexities))
+            if trend - epsilon > 0:
+                return 'deepen'
+            elif trend + epsilon < 0:
+                return 'prune'
+        return None
+
+    def _morph(self, obs_batch=None, method=None, epsilon=0.1):
+        '''
+        Deepen or prune the tree.
+
+        :param obs_batch: An observation batch to evaluate our trees.
+        :param epsilon: minimum entropy difference that must be observed to incentivize morph.
+        '''
+        assert obs_batch is not None
+
+        import ipdb; ipdb.set_trace()
+        if method == 'deepen':
+            # instantiate deepened policy
+            deepened_kwargs = self.policy_kwargs # edit this
+            new_policy = self.policy_class(
+                self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **deepened_kwargs
+            )
+            # this new policy must have the same weights as the old policy, but with more leaves (not necessarily a new depth)
+            # then, the new added leaves must be given some weight too. Generally, splitting it is how regular DTs work, but
+            # in ICCT, they train the new policy for a few epochs as well.
+            new_policy = new_policy.to(self.device)
+        elif method == 'prune':
+            # check that the policy can be pruned
+            pruned_kwargs = self.policy_kwargs # edit this for checking 
+            # instantiate pruned policy
+            pruned_kwargs = self.policy_kwargs # edit this to modify depth
+            new_policy = self.policy_class(
+                self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **pruned_kwargs
+            )
+            new_policy = new_policy.to(self.device)
+        # calculate entropies
+        old_leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+        old_t_proj = F.normalize(self.leaf_proj(old_leaf_probs), dim=1)
+        old_entropy = self._estimate_mutual_info(t_proj, t_proj) # I(T;T) = H(T)
+        new_leaf_probs = new_policy.forward_info_bottleneck(obs_batch)
+        new_t_proj = F.normalize(self.leaf_proj(new_leaf_probs), dim=1)
+        new_entropy = self._estimate_mutual_info(t_proj, t_proj)
+        # compare
+        if method == 'deepen' and old_entropy > new_entropy + epsilon:
+            self.policy = new_policy
+            self.policy_kwargs = deepened_kwargs
+            self.last_morph_timestep = self.num_timesteps
+        elif method == 'prune' and old_entropy < new_entropy - epsilon:
+            self.policy = new_policy
+            self.policy_kwargs = deepened_kwargs
+            self.last_morph_timestep = self.num_timesteps
 
     def learn(
         self: SelfPPO,
