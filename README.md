@@ -41,9 +41,15 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 - [x] Add InfoNCE within PPO `learn()`
     - (Oct 28, 2025) infobottleneck with the leaf probabilities
     - (Oct 28, 2025) add policy complexity analysis
-- [ ] Fix up and merge MLP code
+- [x] Fix up and merge MLP code
+- [ ] Policy complexity dynamic deepening / pruning
+    - [x] (Dec 12, 2025) Fix up leaf issue where model always built a balanced tree with # leaves rounded to the nearest 2nd power instead of using all leaves properly.
+    - [ ] Use the visitations to determine which to prune
+    - [ ] Copy over weights to new model + make new paths
+    - [ ] Freeze all parameters except new leaves; finetune on a minibatch
 
 ### Known bugs
+- [ ] (Dec 3, 2025) temp pred loss also computes for zero obs tensor when it doesn't need to. We probs want to remove such tensors
 - [ ] (Nov 27, 2025) temporal ensemble is *probably* resetting past actions only at beginning of rollout collect, but it should be doing it before every new episode starts instead.
 - [x] (Nov 12, 2025) with the addition of action chunking and MLP, infonce stuff doesn't work
 - [x] (Nov 10, 2025) LaneKeeping is now outputting dictionary observations; 
