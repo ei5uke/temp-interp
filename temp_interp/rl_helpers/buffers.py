@@ -32,7 +32,6 @@ class TemporalRolloutBufferSamples(NamedTuple):
     observations: th.Tensor
     past_observations: th.Tensor
     actions: th.Tensor
-    past_actions: th.Tensor
     old_values: th.Tensor
     old_log_prob: th.Tensor
     advantages: th.Tensor
@@ -359,8 +358,6 @@ class TemporalRolloutBuffer(BaseBuffer):
             num_preds = self.action_dim // self.og_action_dim - 1
             zero_obs = np.zeros((self.n_envs, num_preds, *self.obs_shape))
             concat_obs = np.concat((zero_obs, self.observations.reshape(self.n_envs, -1, *self.obs_shape)), axis=1).reshape(-1, *self.obs_shape)
-            zero_actions = np.zeros((self.n_envs, num_preds, self.action_dim))
-            concat_actions = np.concat((zero_actions, self.actions.reshape(self.n_envs, -1, self.action_dim)), axis=1).reshape(-1, self.action_dim)
             tmp_idcs = []
             for idx in batch_inds:
                 num_zero_vecs_added = ((idx // (self.buffer_size))+1) * num_preds
@@ -371,7 +368,6 @@ class TemporalRolloutBuffer(BaseBuffer):
                 concat_obs[tmp_idcs],
                 # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
                 self.actions[batch_inds].astype(np.float32, copy=False),
-                concat_actions[tmp_idcs].astype(np.float32, copy=False),
                 self.values[batch_inds].flatten(),
                 self.log_probs[batch_inds].reshape(-1, self.action_dim // self.og_action_dim, self.og_action_dim), # self.log_probs[batch_inds].flatten(),
                 self.advantages[batch_inds].flatten(),
