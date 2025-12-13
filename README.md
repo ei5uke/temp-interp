@@ -44,8 +44,8 @@ sbatch temp_interp/run/train_{environment_name}.slurm
 - [x] Fix up and merge MLP code
 - [ ] Policy complexity dynamic deepening / pruning
     - [x] (Dec 12, 2025) Fix up leaf issue where model always built a balanced tree with # leaves rounded to the nearest 2nd power instead of using all leaves properly.
-    - [ ] Use the visitations to determine which to prune
-    - [ ] Copy over weights to new model + make new paths
+    - [x] (Dec 13, 2025) Use the visitations to determine which to prune
+    - [x] (Dec 13, 2025) Copy over weights to new model
     - [ ] Freeze all parameters except new leaves; finetune on a minibatch
 
 ### Known bugs
