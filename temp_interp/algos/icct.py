@@ -14,7 +14,9 @@ class ICCT(nn.Module):
                  weights: t.Union[t.List[np.array], np.array, None],
                  comparators: t.Union[t.List[np.array], np.array, None],
                  alpha: t.Union[t.List[np.array], np.array, None],
+                 paths: t.Union[t.List[np.array], np.array, None],
                  leaves: t.Union[None, int, t.List],  
+                 submodels: t.Union[None, nn.ModuleList],
                  output_dim: t.Optional[int] = None,
                  use_individual_alpha=False,
                  device: str = 'cpu',
@@ -26,7 +28,8 @@ class ICCT(nn.Module):
                  l1_hard_attn = False,
                  num_sub_features = 1,
                  use_gumbel_softmax = False,
-                 alg_type = 'ppo'):
+                 alg_type = 'ppo',
+                 morph_factor = 0.2):
         super(ICCT, self).__init__()
         """
         Initialize the Interpretable Continuous Control Tree (ICCT)
@@ -55,9 +58,10 @@ class ICCT(nn.Module):
         :param use_gumbel_softmax: whether use gumble softmax instead of the differentiable 
                                    argmax (diff_argmax) proposed in the paper
         :param alg_type: current supported RL methods [PPO]
+        :param morph_factor: the factor to which we either increase or reduce the # of parameters
         """
         self.device = device
-        self.num_leaves = leaves
+        self.num_leaves = leaves if type(leaves) == int else len(leaves)
         self.leaf_init_information = leaves
         self.hard_node = hard_node
         self.argmax_tau = argmax_tau
@@ -75,49 +79,50 @@ class ICCT(nn.Module):
         self.use_gumbel_softmax = use_gumbel_softmax
         self.use_individual_alpha = use_individual_alpha
         self.alg_type = alg_type
+        self.morph_factor = morph_factor
 
         self.init_comparators(comparators)
         self.init_weights(weights)
         self.init_alpha(alpha)
-        self.init_paths()
+        self.init_paths(paths)
         self.init_leaves()
+        # self.init_pairs() # TODO: comment out for now
         self.sig = nn.Sigmoid()
         # self.num_leaves = self.layers.size(0) + 1
         
         if self.use_submodels:
-            self.init_submodels() 
+            self.init_submodels(submodels) 
             
         if self.alg_type == 'ppo':
             self.tanh = nn.Tanh()
 
-        self.leaf_visitations = np.zeros(self.num_leaves)
+        self.visitations = np.zeros(self.num_leaves)
 
-    def init_submodels(self):
-        if self.sparse_submodel_type != 2:
-            self.lin_models = nn.ModuleList([nn.Linear(self.input_dim, self.output_dim) for _ in range(self.num_leaves)])
-            if self.sparse_submodel_type == 1:
-                self.leaf_attn = None
+    def init_submodels(self, submodels):
+        if submodels is not None and self.sparse_submodel_type != 2: # we only implement this for ICCT-complete
+            self.lin_models = submodels
         else:
-            self.sub_scalars = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
-            self.sub_weights = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
-            self.sub_biases = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
+            if self.sparse_submodel_type != 2:
+                self.lin_models = nn.ModuleList([nn.Linear(self.input_dim, self.output_dim) for _ in range(self.num_leaves)])
+                if self.sparse_submodel_type == 1:
+                    self.leaf_attn = None
+            else:
+                self.sub_scalars = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
+                self.sub_weights = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
+                self.sub_biases = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
 
-            nn.init.xavier_normal_(self.sub_scalars.data)
-            nn.init.xavier_normal_(self.sub_weights.data)
-            nn.init.xavier_normal_(self.sub_biases.data)
+                nn.init.xavier_normal_(self.sub_scalars.data)
+                nn.init.xavier_normal_(self.sub_weights.data)
+                nn.init.xavier_normal_(self.sub_biases.data)
             
     def init_comparators(self, comparators):
         if comparators is None:
             comparators = []
             if type(self.leaf_init_information) is int:
-                # depth = int(np.floor(np.log2(self.leaf_init_information)))
                 depth = int(np.ceil(np.log2(self.leaf_init_information)))
             else:
                 depth = 4
             self.depth = depth
-            # for level in range(depth):
-            #     for node in range(2**level):
-            #         comparators.append(np.random.normal(0, 1.0, 1))
             for i in range(self.leaf_init_information-1):
                 comparators.append(np.random.normal(0, 1.0, 1))
         new_comps = torch.tensor(np.array(comparators), dtype=torch.float).to(self.device)
@@ -128,13 +133,9 @@ class ICCT(nn.Module):
         if weights is None:
             weights = []
             if type(self.leaf_init_information) is int:
-                # depth = int(np.floor(np.log2(self.leaf_init_information)))
                 depth = int(np.ceil(np.log2(self.leaf_init_information)))
             else:
                 depth = 4
-            # for level in range(depth):
-            #     for node in range(2**level):
-            #         weights.append(np.random.rand(self.input_dim))
             for i in range(self.leaf_init_information-1):
                 weights.append(np.random.rand(self.input_dim))
 
@@ -147,13 +148,9 @@ class ICCT(nn.Module):
             if self.use_individual_alpha:
                 alphas = []
                 if type(self.leaf_init_information) is int:
-                    # depth = int(np.floor(np.log2(self.leaf_init_information)))
                     depth = int(np.ceil(np.log2(self.leaf_init_information)))
                 else:
                     depth = 4
-                # for level in range(depth):
-                #     for node in range(2**level):
-                #         alphas.append([1.0])
                 for i in range(self.leaf_init_information-1):
                     alphas.append([1.0])
             else:
@@ -164,7 +161,7 @@ class ICCT(nn.Module):
         self.alpha.requires_grad = True
         self.alpha = nn.Parameter(self.alpha, requires_grad=True)
 
-    def init_paths(self):
+    def init_paths(self, paths):
         '''
         # at current comparator, which node can you still reach if you take l/r right now?
         with 3:
@@ -224,43 +221,47 @@ class ICCT(nn.Module):
                  0 0 0 0 0 0 0 0 1
                  0 1 0 0 0 0 0 0 0]
         '''
-        if type(self.leaf_init_information) is list:
-            left_branches = torch.zeros((len(self.layers), len(self.leaf_init_information)), dtype=torch.float)
-            right_branches = torch.zeros((len(self.layers), len(self.leaf_init_information)), dtype=torch.float)
-            for n in range(0, len(self.leaf_init_information)):
-                for i in self.leaf_init_information[n][0]:
-                    left_branches[i][n] = 1.0
-                for j in self.leaf_init_information[n][1]:
-                    right_branches[j][n] = 1.0
+        if paths is not None:
+            self.left_path_sigs = nn.Parameter(paths[0].to(self.device), requires_grad=False)
+            self.right_path_sigs = nn.Parameter(paths[1].to(self.device), requires_grad=False)
         else:
-            if type(self.leaf_init_information) is int:
-                low_depth = int(np.floor(np.log2(self.leaf_init_information)))
-                depth = int(np.ceil(np.log2(self.leaf_init_information)))
+            if type(self.leaf_init_information) is list:
+                left_branches = torch.zeros((len(self.layers), len(self.leaf_init_information)), dtype=torch.float)
+                right_branches = torch.zeros((len(self.layers), len(self.leaf_init_information)), dtype=torch.float)
+                for n in range(0, len(self.leaf_init_information)):
+                    for i in self.leaf_init_information[n][0]:
+                        left_branches[i][n] = 1.0
+                    for j in self.leaf_init_information[n][1]:
+                        right_branches[j][n] = 1.0
             else:
-                depth = 4
-            left_branches = torch.zeros((self.leaf_init_information - 1, self.leaf_init_information), dtype=torch.float)
-            right_branches = torch.zeros((self.leaf_init_information - 1, self.leaf_init_information), dtype=torch.float)
-            # this variable keeps track of the closest 2nd power
-            closest_second_power = 2**np.floor(np.log2(self.leaf_init_information))
-            # these idcs only track the left_branch
-            end_idx = int((self.leaf_init_information - closest_second_power) + closest_second_power//2)
-            left_branches[0, :end_idx] = 1
-            right_branches[0, end_idx:] = 1
-            queue = [(0, end_idx), (end_idx, self.leaf_init_information)]
-            i = 1
-            while i < self.leaf_init_information - 1:
-                m = queue.pop(0)
-                start_idx, end_idx = m[0], m[1]
-                half_idx = int(np.ceil((start_idx + end_idx) / 2))
-                left_branches[i, start_idx:half_idx] = 1
-                right_branches[i, half_idx:end_idx] = 1
-                queue.append((start_idx, half_idx))
-                queue.append((half_idx, end_idx))
-                i += 1
-        left_branches.requires_grad = False
-        right_branches.requires_grad = False
-        self.left_path_sigs = nn.Parameter(left_branches.to(self.device), requires_grad=False)
-        self.right_path_sigs = nn.Parameter(right_branches.to(self.device), requires_grad=False)
+                if type(self.leaf_init_information) is int:
+                    low_depth = int(np.floor(np.log2(self.leaf_init_information)))
+                    depth = int(np.ceil(np.log2(self.leaf_init_information)))
+                else:
+                    depth = 4
+                left_branches = torch.zeros((self.leaf_init_information - 1, self.leaf_init_information), dtype=torch.float)
+                right_branches = torch.zeros((self.leaf_init_information - 1, self.leaf_init_information), dtype=torch.float)
+                # this variable keeps track of the closest 2nd power
+                closest_second_power = 2**np.floor(np.log2(self.leaf_init_information))
+                # these idcs only track the left_branch
+                end_idx = int((self.leaf_init_information - closest_second_power) + closest_second_power//2)
+                left_branches[0, :end_idx] = 1
+                right_branches[0, end_idx:] = 1
+                queue = [(0, end_idx), (end_idx, self.leaf_init_information)]
+                i = 1
+                while i < self.leaf_init_information - 1:
+                    m = queue.pop(0)
+                    start_idx, end_idx = m[0], m[1]
+                    half_idx = int(np.ceil((start_idx + end_idx) / 2))
+                    left_branches[i, start_idx:half_idx] = 1
+                    right_branches[i, half_idx:end_idx] = 1
+                    queue.append((start_idx, half_idx))
+                    queue.append((half_idx, end_idx))
+                    i += 1
+            left_branches.requires_grad = False
+            right_branches.requires_grad = False
+            self.left_path_sigs = nn.Parameter(left_branches.to(self.device), requires_grad=False)
+            self.right_path_sigs = nn.Parameter(right_branches.to(self.device), requires_grad=False)
 
     def init_leaves(self):
         if type(self.leaf_init_information) is list:
@@ -380,7 +381,6 @@ class ICCT(nn.Module):
                 ret.append(output.permute(2, 0, 1))
             return torch.sum(torch.stack(ret, dim=0), dim=0)  
 
-
     def forward(self, input_data, embedding_list=None):
         # self.comparators: [num_node, 1]
 
@@ -478,7 +478,7 @@ class ICCT(nn.Module):
                     output[e] = i(input_copy)
             else:
                 output = self.fs_submodels(input_copy).transpose(0, 1)
-            self.leaf_visitations += probs.sum(dim=0).detach().numpy()
+            self.visitations += probs.sum(dim=0).detach().numpy()
             actions = torch.bmm(probs.reshape(-1, 1, self.num_leaves), output.transpose(0, 1))
             mus = actions.squeeze(1)
         else:
@@ -574,3 +574,114 @@ class ICCT(nn.Module):
             # probs: [batch_size, num_leaves]
             probs = probs.prod(dim=1)
             return probs
+
+    # def init_pairs(self):
+    #     '''
+    #     Given the # leaves, find which leaves are paired together and which are not. 
+    #     Also find which leaves correlate to which parent nodes.
+
+    #     # odd. calculate how many pairs before a single one. then pairs again.
+    #     # [0 1, 2] 3 - 2 = 1 (pair)
+    #     # [0 1, 2, 3 4] 5 - 4 = 1 (1 pair)
+    #     # [0 1, 2 3, 4 5, 6] 7 - 4 = 3 (3 pairs)
+    #     # [0 1, 2, 3 4, 5 6, 7 8] 9 - 8 = 1 (1 pair)
+    #     # [0 1, 2 3, 4 5, 6, 7 8, 9 10] 11 - 8 = 3 (3 pairs)
+
+    #     # even
+    #     # [0 1, 2 3, 4 5, 6 7, 8 9]. even is just split into twos.
+    #     '''
+    #     stack = []
+    #     i = 0
+    #     depth = int(np.floor(np.log2(self.num_leaves)))
+    #     while len(stack) < self.num_leaves - 1:
+    #         level = []
+    #         for j in range(2**i):
+    #             level.append(2**i-1+j)
+    #             if len(level) + len(stack) == self.num_leaves - 1: break
+    #         stack = level + stack
+    #         i += 1
+
+    #     pair_map = {}
+    #     node_map = {}
+    #     num_nodes_before_single = 2*int(self.num_leaves - 2**np.floor(np.log2(self.num_leaves)))
+    #     popped_nodes = set()
+    #     i = 0
+    #     while i < self.num_leaves:
+    #         node = stack.pop(0)
+    #         # check if all of node's children have been popped. If they have, we can skip to next node.
+    #         if node * 2 + 1 in popped_nodes and node * 2 + 2 in popped_nodes: continue
+    #         popped_nodes.add(node)
+    #         if i == num_nodes_before_single and self.num_leaves % 2 == 1:
+    #             pair_map[i] = None
+    #             node_map[i] = node
+    #             i += 1
+    #         else:
+    #             pair_map[i] = i+1
+    #             pair_map[i+1] = i
+    #             node_map[i] = node
+    #             node_map[i+1] = node
+    #             i += 2
+    #     self.pair_map = pair_map
+    #     self.node_map = node_map
+
+    # def get_pruned_features(self):
+    #     '''
+    #     For a pruned tree, return important pruned features:
+    #     lin_models, comparators, layers, alphas, paths.
+
+    #     Choose the leaf to prune by picking the leaves with the least visitations
+    #     '''
+    #     import ipdb; ipdb.set_trace()
+    #     if self.num_leaves == 1: return # cannot prune any more leaves
+    #     num_remove_leaves = int(np.ceil(self.num_leaves * self.morph_factor))
+    #     if num_remove_leaves >= self.num_leaves: num_remove_leaves = self.num_leaves - 1
+    #     remove_idcs = np.argsort(self.visitations)[:num_remove_leaves]
+    #     pruned_idcs = np.argsort(self.visitations)[num_remove_leaves:]
+        
+    #     lin_models = []
+    #     for idx in pruned_idcs:
+    #         lin_models.append(self.lin_models[idx])
+    #     lin_models = nn.ModuleList(lin_models)
+    #     # n-1 shape
+    #     # for a leaf we want to remove, we have to edit a comparator weight. If we're removing both left and right leaves
+    #     # of a comparator, we must remove that comparator itself
+    #     # bigger comparator mean more chance to go right. small comparator means more chance to go left.
+
+    #     # [c1 c2 c3]; [0 1 2 3]. 
+    #     # 1. Remove idx 2
+    #     # make c3 huge to go right.
+    #     # 2. Remove idx 2, then 3 later on.
+    #     # make c3 huge to go right. Later, see that 2 was already removed so remove c3 and make c1 small to go left.
+
+    #     # [c1 c2 c3 c4]; [0 1, 2, 3 4].
+    #     # 1. Remove idx 2
+    #     # make c2 small to go left.
+    #     # 2. Remove idx 2 and 3
+    #     # make c2 small to go left and make c3 huge to go right
+    #     # 3. Remove idx 3 and 4
+    #     # remove c3 and make c1 small to go left.
+
+    #     # [c1 c2 c3 c4 c5]; [0 1, 2 3, 4 5]
+    #     # it's a stack but reversed
+
+    #     # ifpower of 2, then the # of pairs maps directly to the last # of nodes
+
+    #     # count if all the children of a node were visited.
+
+    #     # only remove one leaf out of a pair at a time.
+    #     idcs = []
+    #     for idx in remove_idcs:
+    #         if self.pair_map[idx] in idcs:
+    #             continue
+    #         idcs.append(idx)
+    #     remove_idcs = idcs
+
+
+    #     # these need the node idcs not the leaf idcs.
+    #     comparators = self.comparators[pruned_idcs].copy()
+    #     layers = self.layers[pruned_idcs].copy()
+    #     alpha = self.alpha[pruned_idcs].copy()
+        
+    #     # this paths is the hardest probably
+    #     # self.left_path_sigs # (n-1, n) shape
+    #     # self.right_path_Sigs
