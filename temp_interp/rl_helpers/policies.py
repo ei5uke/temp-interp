@@ -136,6 +136,7 @@ class ICCTPolicy(BasePolicy):
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
+        self.new_action_net = None # set to None by default. Add a tree when deepening/pruning
 
         self.share_features_extractor = share_features_extractor
         self.features_extractor = self.make_features_extractor()
@@ -231,6 +232,8 @@ class ICCTPolicy(BasePolicy):
                         comparators=None,
                         leaves=self.ddt_kwargs['num_leaves'],
                         alpha=None,
+                        paths=None,
+                        submodels=None,
                         use_individual_alpha=self.ddt_kwargs['use_individual_alpha'],
                         device=self.ddt_kwargs['device'],
                         use_submodels=self.ddt_kwargs['submodels'],
@@ -385,7 +388,7 @@ class ICCTPolicy(BasePolicy):
         time_indices = th.arange(n_tensors - 1, -1, -1)
         return stacked_actions, n_tensors, n_envs, time_indices
 
-    def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def forward_info_bottleneck(self, obs: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
 
@@ -399,7 +402,10 @@ class ICCTPolicy(BasePolicy):
         else:
             pi_features, vf_features = features
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
-        input_compressions = self.action_net.forward_input_compressions(latent_pi)
+        if not morphed:
+            input_compressions = self.action_net.forward_input_compressions(latent_pi)
+        else:
+            input_compressions = self.new_action_net.forward_input_compressions(latent_pi)
         return input_compressions
 
     def extract_features(  # type: ignore[override]
@@ -426,7 +432,7 @@ class ICCTPolicy(BasePolicy):
             vf_features = super().extract_features(obs, self.vf_features_extractor)
             return pi_features, vf_features
 
-    def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None) -> Distribution:
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None, morphed=False) -> Distribution:
         """
         Retrieve action distribution given the latent codes.
         If actions is given, then evaluate at the action-level, not the action-chunk-level.
@@ -434,7 +440,10 @@ class ICCTPolicy(BasePolicy):
         :param latent_pi: Latent code for the actor
         :return: Action distribution
         """
-        mean_actions = self.action_net(latent_pi)
+        if not morphed:
+            mean_actions = self.action_net(latent_pi)
+        else:
+            mean_actions = self.new_action_net(latent_pi)
         if actions is not None:
             # new to RPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py
             z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
@@ -451,7 +460,7 @@ class ICCTPolicy(BasePolicy):
         """
         return self.get_distribution(observation).get_actions(deterministic=deterministic)
 
-    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
+    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Evaluate actions according to the current policy,
         given the observations.
@@ -471,7 +480,7 @@ class ICCTPolicy(BasePolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         values = self.value_net(latent_vf)
-        distribution = self._get_action_dist_from_latent(latent_pi, actions)
+        distribution = self._get_action_dist_from_latent(latent_pi, actions, morphed)
         if self.abstraction_type == 'temp-ensemble':
             # zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
             actions_reshaped = actions.reshape(-1, self.time_horizon, self.og_action_dim)

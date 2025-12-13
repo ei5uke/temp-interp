@@ -3,6 +3,7 @@
 # modified PPO to include action chunking training.
 
 import warnings
+import copy
 from typing import Any, ClassVar, Optional, TypeVar, Union
 
 import numpy as np
@@ -20,6 +21,7 @@ from stable_baselines3.common.preprocessing import get_action_dim
 
 from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy
 from temp_interp.rl_helpers.buffers import TemporalRolloutBuffer
+from temp_interp.algos.icct_helpers import prune_icct
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -532,11 +534,12 @@ class PPO(OnPolicyAlgorithm):
         :param epsilon: the minimum average gradient that must be observed to incentivize morph.
         '''
         if self.num_timesteps - self.last_morph_timestep > min_timesteps:
-            trend = np.mean(np.gradient(self.policy_complexities))
-            if trend - epsilon > 0:
-                return 'deepen'
-            elif trend + epsilon < 0:
-                return 'prune'
+            # trend = np.mean(np.gradient(self.policy_complexities))
+            # if trend - epsilon > 0:
+            #     return 'deepen'
+            # elif trend + epsilon < 0:
+            #     return 'prune'
+            return 'prune'
         return None
 
     def _morph(self, obs_batch=None, method=None, epsilon=0.1):
@@ -548,7 +551,6 @@ class PPO(OnPolicyAlgorithm):
         '''
         assert obs_batch is not None
 
-        import ipdb; ipdb.set_trace()
         if method == 'deepen':
             # instantiate deepened policy
             deepened_kwargs = self.policy_kwargs # edit this
@@ -561,28 +563,32 @@ class PPO(OnPolicyAlgorithm):
             new_policy = new_policy.to(self.device)
         elif method == 'prune':
             # check that the policy can be pruned
-            pruned_kwargs = self.policy_kwargs # edit this for checking 
-            # instantiate pruned policy
-            pruned_kwargs = self.policy_kwargs # edit this to modify depth
-            new_policy = self.policy_class(
-                self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **pruned_kwargs
-            )
-            new_policy = new_policy.to(self.device)
+            # pruned_kwargs = self.policy_kwargs # edit this to modify depth
+            # new_policy = self.policy_class(
+            #     self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **pruned_kwargs
+            # )
+            # pruned_features = self.policy.action_net.get_pruned_features() # TODO: may remove
+            # new_policy = new_policy.to(self.device)
+            import ipdb; ipdb.set_trace()
+            pruned_tree = prune_icct(self.policy.action_net)
+            self.policy.new_action_net = pruned_tree
         # calculate entropies
         old_leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
         old_t_proj = F.normalize(self.leaf_proj(old_leaf_probs), dim=1)
-        old_entropy = self._estimate_mutual_info(t_proj, t_proj) # I(T;T) = H(T)
-        new_leaf_probs = new_policy.forward_info_bottleneck(obs_batch)
-        new_t_proj = F.normalize(self.leaf_proj(new_leaf_probs), dim=1)
-        new_entropy = self._estimate_mutual_info(t_proj, t_proj)
+        old_entropy = self._estimate_mutual_info(old_t_proj, old_t_proj) # I(T;T) = H(T)
+        new_leaf_probs = self.policy.forward_info_bottleneck(obs_batch, morphed=True)
+        new_t_proj = F.normalize(self.leaf_proj(new_leaf_probs), dim=1) # since we prune leaves, this model doesn't work anymore
+        # we must create a new model with less/more leaves. Idk how smart this is.
+        new_entropy = self._estimate_mutual_info(new_t_proj, new_t_proj)
         # compare
         if method == 'deepen' and old_entropy > new_entropy + epsilon:
             self.policy = new_policy
             self.policy_kwargs = deepened_kwargs
             self.last_morph_timestep = self.num_timesteps
         elif method == 'prune' and old_entropy < new_entropy - epsilon:
-            self.policy = new_policy
-            self.policy_kwargs = deepened_kwargs
+            self.action_net = self.new_action_net
+            self.new_action_net = None
+            # self.policy_kwargs = deepened_kwargs
             self.last_morph_timestep = self.num_timesteps
 
     def learn(
