@@ -131,8 +131,7 @@ def find_children(node, leaves, current_depth):
     if not right_child_is_leaf:
         find_children(right_child, right_subtree, current_depth + 1)
 
-# def prune_icct(tree, decision_node_index, prune_left, use_gpu=False):
-def prune_icct(tree, use_gpu=False):
+def prune_icct(tree, device='cpu'):
     leaf_info = tree.leaf_init_information
     leaves_with_idx = copy.deepcopy([(leaf_idx, leaf_info[leaf_idx]) for leaf_idx in range(len(leaf_info))])
     root = Node(find_root(leaves_with_idx), 0)
@@ -145,7 +144,7 @@ def prune_icct(tree, use_gpu=False):
     if len(pruned_node_children) == 1:
         prune_left = True
     else:
-        if pruned_node_children[0] == pruned_leaf
+        if pruned_node_children[0] == pruned_leaf:
             prune_left = True
         else:
             prune_left = False
@@ -273,7 +272,7 @@ def prune_icct(tree, use_gpu=False):
                     paths=None, # may not need
                     submodels=new_submodels,
                     use_individual_alpha=tree.use_individual_alpha, 
-                    device='cuda' if use_gpu else 'cpu',
+                    device=device,
                     use_submodels=tree.use_submodels,
                     hard_node=tree.hard_node,
                     argmax_tau=tree.argmax_tau,
@@ -284,8 +283,9 @@ def prune_icct(tree, use_gpu=False):
                     use_gumbel_softmax=tree.use_gumbel_softmax,
                     alg_type=tree.alg_type)
 
-    if use_gpu:
-        new_network = new_network.cuda()
+    # TODO: freeze all weights except the ones correlated to the pruned leaf and node
+    # This may not be possible due to how the graph works.
+
     return new_network
 
 def node_leaf_map(num_leaves):
