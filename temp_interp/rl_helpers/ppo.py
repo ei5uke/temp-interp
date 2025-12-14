@@ -354,50 +354,21 @@ class PPO(OnPolicyAlgorithm):
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
 
-                # DDT addition
-                if type(self.policy) is ICCTPolicy:
-                    if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
-                        attn = self.policy.action_net.leaf_attn.repeat_interleave(2)
-
-                # Normalize advantage
-                advantages = rollout_data.advantages
-                # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-                if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-                # ratio between old and new policy, should be one at the first iteration
-                if self.policy.abstraction_type == 'temp-ensemble':
-                    ratio = th.exp(log_prob - rollout_data.old_log_prob)
-                elif self.policy.abstraction_type == 'temp-pred':
-                    old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
-                    ratio = th.exp(log_prob[:, :self.policy.og_action_dim].sum(dim=1) - old_log_prob)
-
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-                # DDT addition
-                if type(self.policy) is ICCTPolicy:
-                    if self.policy.action_net.use_submodels and self.policy.action_net.sparse_submodel_type == 1:
-                        l1_reg_loss = 0
-                        if self.policy.action_net_kwargs['l1_reg_bias']:
-                            for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
-                                l1_reg_loss += th.sum(abs(p)) * attn[i]
-                        else:
-                            for i, (name, p) in enumerate(self.policy.action_net.lin_models.named_parameters()):
-                                if not 'bias' in name:
-                                    l1_reg_loss += th.sum(abs(p)) * attn[i]
-                        l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
-                        l1_reg_losses.append(l1_reg_loss.item())
-                        policy_loss += l1_reg_loss
+                # Policy loss
+                losses = self._policy_loss_helper(self.policy.action_net, rollout_data, log_prob, clip_range)
+                policy_loss = losses['policy_loss']
+                ratio = losses['ratio']
+                if self.policy.abstraction_type == 'temp-pred': temp_pred_loss = losses['temp_pred_loss']
 
                 # Logging
                 pg_losses.append(policy_loss.item())
                 ratios.append(ratio.mean().item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
+                if self.policy.abstraction_type == 'temp-pred': 
+                    pred_losses.append(temp_pred_loss.item())
 
+                # Value loss using the TD(gae_lambda) target
                 if self.clip_range_vf is None:
                     # No clipping
                     values_pred = values
@@ -407,7 +378,6 @@ class PPO(OnPolicyAlgorithm):
                     values_pred = rollout_data.old_values + th.clamp(
                         values - rollout_data.old_values, -clip_range_vf, clip_range_vf
                     )
-                # Value loss using the TD(gae_lambda) target
                 value_loss = F.mse_loss(rollout_data.returns, values_pred)
                 value_losses.append(value_loss.item())
 
@@ -421,21 +391,7 @@ class PPO(OnPolicyAlgorithm):
                 entropy_losses.append(entropy_loss.item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-
-                # temporal loss only if abstraction is temp-pred
-                if self.policy.abstraction_type == 'temp-pred':
-                    # temporal prediction loss 1 (log prob)
-                    curr_action = rollout_data.actions.clone()
-                    curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.policy.time_horizon)
-                    _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
-                        curr_action.repeat_interleave(self.policy.time_horizon - 1, dim=0))
-                    pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.policy.time_horizon, self.policy.og_action_dim).sum(dim=-1)
-                    idcs = th.tensor(th.arange(self.policy.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
-                    pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.policy.time_horizon - 1)
-                    # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
-                    temp_pred_loss = -pred_log_prob.mean()
-                    loss = loss + (1 - self._current_progress_remaining) * temp_pred_loss
-                    pred_losses.append(temp_pred_loss.item())
+                if self.policy.abstraction_type == 'temp-pred': loss += temp_pred_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -467,13 +423,9 @@ class PPO(OnPolicyAlgorithm):
         ### mutual information (mi) analysis
         mi_batch = next(self.rollout_buffer.get(self.batch_size))
         obs_batch = mi_batch.observations
-        # obs_batch_squashed = None
-
         action_batch = mi_batch.actions
         with th.no_grad():
-            # estimate policy complexity, for curr action and action chunk
-            # s_proj = F.normalize(self.state_proj(obs_batch_squashed.to(th.float32)
-            #     if obs_batch_squashed is not None else obs_batch.to(th.float32)), dim=1)
+            # Estimate policy complexity, for curr action and action chunk
             s_proj = F.normalize(self.state_proj(obs_batch.to(th.float32)), dim=1)
             a_proj = F.normalize(self.action_proj(action_batch[:, :self.policy.og_action_dim]), dim=1)
             ac_proj = F.normalize(self.action_chunk_proj(action_batch), dim=1)
@@ -481,7 +433,8 @@ class PPO(OnPolicyAlgorithm):
             self.policy_complexities.append(policy_complexity)
             self.logger.record(f"train/I(S;A)", policy_complexity)
             self.logger.record(f"train/I(S;AC)", self._estimate_mutual_info(s_proj, ac_proj))
-            # information bottleneck no layers
+
+            # Information bottleneck
             leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
             t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
             self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
@@ -500,6 +453,7 @@ class PPO(OnPolicyAlgorithm):
         # self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+        self.logger.record("train/num_leaves", int(self.policy.action_net.num_leaves))
 
         # self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         # self.logger.record("train/clip_range", clip_range)
@@ -509,9 +463,60 @@ class PPO(OnPolicyAlgorithm):
         # deepen / prune the tree
         method = self._check_morph()
         if method is not None:
-            morph_batch = next(self.rollout_buffer.get(self.batch_size))
-            obs_batch = mi_batch.observations
-            self._morph(obs_batch, method)
+            morph_rollout_data = next(self.rollout_buffer.get(self.batch_size)) # this batch size might have to be bigger
+            self._morph(morph_rollout_data, method, clip_range)
+
+    def _policy_loss_helper(self, action_net, rollout_data, log_prob, clip_range):
+        # Normalize advantage
+        advantages = rollout_data.advantages
+        # Normalization does not make sense if mini batchsize == 1, see GH issue #325
+        if self.normalize_advantage and len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # ratio between old and new policy, should be one at the first iteration
+        if self.policy.abstraction_type == 'temp-ensemble':
+            ratio = th.exp(log_prob - rollout_data.old_log_prob)
+        elif self.policy.abstraction_type == 'temp-pred':
+            old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
+            ratio = th.exp(log_prob[:, :self.policy.og_action_dim].sum(dim=1) - old_log_prob)
+
+        # clipped surrogate loss
+        policy_loss_1 = advantages * ratio
+        policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+        policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+        # DDT addition
+        if type(self.policy) is ICCTPolicy:
+            if action_net.use_submodels and action_net.sparse_submodel_type == 1:
+                attn = action_net.leaf_attn.repeat_interleave(2)
+                l1_reg_loss = 0
+                if action_net_kwargs['l1_reg_bias']:
+                    for i, (name, p) in enumerate(action_net.lin_models.named_parameters()):
+                        l1_reg_loss += th.sum(abs(p)) * attn[i]
+                else:
+                    for i, (name, p) in enumerate(action_net.lin_models.named_parameters()):
+                        if not 'bias' in name:
+                            l1_reg_loss += th.sum(abs(p)) * attn[i]
+                l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
+                l1_reg_losses.append(l1_reg_loss.item())
+                policy_loss += l1_reg_loss
+
+        losses = {'policy_loss': policy_loss, 'ratio': ratio}
+
+        # temporal loss only if abstraction is temp-pred
+        if self.policy.abstraction_type == 'temp-pred':
+            # temporal prediction loss 1 (log prob)
+            curr_action = rollout_data.actions.clone()
+            curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.policy.time_horizon)
+            _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
+                curr_action.repeat_interleave(self.policy.time_horizon - 1, dim=0))
+            pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.policy.time_horizon, self.policy.og_action_dim).sum(dim=-1)
+            idcs = th.tensor(th.arange(self.policy.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
+            pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.policy.time_horizon - 1)
+            # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
+            temp_pred_loss = (1 - self._current_progress_remaining) * -pred_log_prob.mean()
+            losses['temp_pred_loss'] = temp_pred_loss
+        return losses
 
     def _estimate_mutual_info(self, proj_A, proj_B, temp=0.1):
         '''
@@ -537,59 +542,76 @@ class PPO(OnPolicyAlgorithm):
             # trend = np.mean(np.gradient(self.policy_complexities))
             # if trend - epsilon > 0:
             #     return 'deepen'
-            # elif trend + epsilon < 0:
+            # elif trend + epsilon < 0 and self.policy.action_net.num_leaves > 1:
             #     return 'prune'
             return 'prune'
         return None
 
-    def _morph(self, obs_batch=None, method=None, epsilon=0.1):
+    def _morph(self, rollout_data, method, clip_range, epsilon=0.1):
         '''
         Deepen or prune the tree.
 
-        :param obs_batch: An observation batch to evaluate our trees.
+        :param rollout_data: A rollout batch to evaluate our trees.
         :param epsilon: minimum entropy difference that must be observed to incentivize morph.
         '''
-        assert obs_batch is not None
+        assert rollout_data is not None
 
         if method == 'deepen':
-            # instantiate deepened policy
-            deepened_kwargs = self.policy_kwargs # edit this
-            new_policy = self.policy_class(
-                self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **deepened_kwargs
-            )
+            # TODO
             # this new policy must have the same weights as the old policy, but with more leaves (not necessarily a new depth)
             # then, the new added leaves must be given some weight too. Generally, splitting it is how regular DTs work, but
             # in ICCT, they train the new policy for a few epochs as well.
-            new_policy = new_policy.to(self.device)
+            pass
         elif method == 'prune':
-            # check that the policy can be pruned
-            # pruned_kwargs = self.policy_kwargs # edit this to modify depth
-            # new_policy = self.policy_class(
-            #     self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **pruned_kwargs
-            # )
-            # pruned_features = self.policy.action_net.get_pruned_features() # TODO: may remove
-            # new_policy = new_policy.to(self.device)
-            import ipdb; ipdb.set_trace()
-            pruned_tree = prune_icct(self.policy.action_net)
+            print("***Trying to prune***")
+            pruned_tree = prune_icct(self.policy.action_net, self.device).to(self.device)
             self.policy.new_action_net = pruned_tree
-        # calculate entropies
-        old_leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+            pruned_optimizer = type(self.policy.optimizer)(self.policy.new_action_net.parameters(), **self.policy.optimizer.defaults)
+            curr_optimizer_lr = self.policy.optimizer.param_groups[0]['lr']
+            pruned_optimizer.param_groups[0]['lr'] = curr_optimizer_lr
+
+            # finetune the new policy on a batch
+            # TODO: we may want to do multiple epochs + increase batch size here.
+            # ALSO, we're currently only finetuning the pruned tree and not the policy tree. That may be an issue.
+            actions = rollout_data.actions
+            if isinstance(self.action_space, spaces.Discrete):
+                # Convert discrete action from float to long
+                actions = rollout_data.actions.long().flatten()
+            _, log_prob, _ = self.policy.evaluate_actions(rollout_data.observations, actions, True)
+            losses = self._policy_loss_helper(self.policy.new_action_net, rollout_data, log_prob, clip_range)
+            loss = losses['policy_loss']
+            if self.policy.abstraction_type == 'temp-pred': loss += losses['temp_pred_loss']
+            pruned_optimizer.zero_grad()
+            loss.backward()
+            th.nn.utils.clip_grad_norm_(self.policy.new_action_net.parameters(), self.max_grad_norm)
+            pruned_optimizer.step()
+
+        # Calculate entropies
+        old_leaf_probs = self.policy.forward_info_bottleneck(rollout_data.observations)
         old_t_proj = F.normalize(self.leaf_proj(old_leaf_probs), dim=1)
         old_entropy = self._estimate_mutual_info(old_t_proj, old_t_proj) # I(T;T) = H(T)
-        new_leaf_probs = self.policy.forward_info_bottleneck(obs_batch, morphed=True)
-        new_t_proj = F.normalize(self.leaf_proj(new_leaf_probs), dim=1) # since we prune leaves, this model doesn't work anymore
-        # we must create a new model with less/more leaves. Idk how smart this is.
+        new_leaf_probs = self.policy.forward_info_bottleneck(rollout_data.observations, morphed=True)
+        new_leaf_proj = th.nn.Linear(self.policy.new_action_net.num_leaves, self.dim_common).to(self.device)
+        new_t_proj = F.normalize(new_leaf_proj(new_leaf_probs), dim=1)
         new_entropy = self._estimate_mutual_info(new_t_proj, new_t_proj)
-        # compare
-        if method == 'deepen' and old_entropy > new_entropy + epsilon:
-            self.policy = new_policy
-            self.policy_kwargs = deepened_kwargs
+
+        print(f"old_entropy: {old_entropy}, new_entropy: {new_entropy}")
+        # Compare and morph
+        if method == 'deepen' and old_entropy + epsilon < new_entropy:
+            # make policy more complex
+            # TODO
+            pass
+        elif method == 'prune' and old_entropy > new_entropy + epsilon:
+            # make policy less complex
+            self.policy.action_net = self.policy.new_action_net
             self.last_morph_timestep = self.num_timesteps
-        elif method == 'prune' and old_entropy < new_entropy - epsilon:
-            self.action_net = self.new_action_net
-            self.new_action_net = None
-            # self.policy_kwargs = deepened_kwargs
-            self.last_morph_timestep = self.num_timesteps
+            self.leaf_proj = new_leaf_proj
+            self.policy.optimizer = type(self.policy.optimizer)(self.policy.parameters(), **self.policy.optimizer.defaults)
+            self.policy.optimizer.param_groups[0]['lr'] = curr_optimizer_lr
+            print("***Successfully pruned!!!***")
+        else:
+            print("***Did not morph***")
+        self.policy.new_action_net = None
 
     def learn(
         self: SelfPPO,
