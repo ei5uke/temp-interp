@@ -478,7 +478,7 @@ class ICCT(nn.Module):
                     output[e] = i(input_copy)
             else:
                 output = self.fs_submodels(input_copy).transpose(0, 1)
-            self.visitations += probs.sum(dim=0).detach().numpy()
+            self.visitations += probs.sum(dim=0).detach().cpu().numpy()
             actions = torch.bmm(probs.reshape(-1, 1, self.num_leaves), output.transpose(0, 1))
             mus = actions.squeeze(1)
         else:
