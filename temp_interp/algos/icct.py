@@ -499,24 +499,10 @@ class ICCT(nn.Module):
         with torch.no_grad():
             # self.comparators: [num_node, 1]
 
-            if self.hard_node:
-                ## node crispification
-                weights = torch.abs(self.layers)
-                # onehot_weights: [num_nodes, num_leaves]
-                onehot_weights = self.diff_argmax(weights)
-                # divisors: [num_node, 1]
-                divisors = (weights * onehot_weights).sum(-1).unsqueeze(-1)
-                # fill 0 with 1
-                divisors_filler = torch.zeros(divisors.size()).to(divisors.device)
-                divisors_filler[divisors==0] = 1
-                divisors = divisors + divisors_filler
-                new_comps = self.comparators / divisors
-                new_weights = self.layers * onehot_weights / divisors
-                new_alpha = self.alpha
-            else:
-                new_comps = self.comparators
-                new_weights = self.layers
-                new_alpha = self.alpha
+            # don't crispify to get true probs
+            new_comps = self.comparators
+            new_weights = self.layers
+            new_alpha = self.alpha
 
             # original input_data dim: [batch_size, input_dim]
             input_copy = input_data.clone()
@@ -533,14 +519,8 @@ class ICCT(nn.Module):
                 comp = comp.mul(new_alpha.expand(input_data.size(0), *new_alpha.size()))
             else:
                 comp = comp.mul(new_alpha)
-            if self.hard_node:
-                ## outcome crispification
-                # sig_vals: [batch_size, num_node, 2]
-                sig_vals = self.diff_argmax(torch.cat((comp, torch.zeros((input_data.size(0), self.layers.size(0), 1)).to(comp.device)), dim=-1))
-                
-                sig_vals = torch.narrow(sig_vals, 2, 0, 1).squeeze(-1)
-            else:
-                sig_vals = self.sig(comp)
+            # don't crispify to get true probs
+            sig_vals = self.sig(comp)
             # sig_vals: [batch_size, num_node]
             sig_vals = sig_vals.view(input_data.size(0), -1)
             # one_minus_sig: [batch_size, num_node]
@@ -574,114 +554,3 @@ class ICCT(nn.Module):
             # probs: [batch_size, num_leaves]
             probs = probs.prod(dim=1)
             return probs
-
-    # def init_pairs(self):
-    #     '''
-    #     Given the # leaves, find which leaves are paired together and which are not. 
-    #     Also find which leaves correlate to which parent nodes.
-
-    #     # odd. calculate how many pairs before a single one. then pairs again.
-    #     # [0 1, 2] 3 - 2 = 1 (pair)
-    #     # [0 1, 2, 3 4] 5 - 4 = 1 (1 pair)
-    #     # [0 1, 2 3, 4 5, 6] 7 - 4 = 3 (3 pairs)
-    #     # [0 1, 2, 3 4, 5 6, 7 8] 9 - 8 = 1 (1 pair)
-    #     # [0 1, 2 3, 4 5, 6, 7 8, 9 10] 11 - 8 = 3 (3 pairs)
-
-    #     # even
-    #     # [0 1, 2 3, 4 5, 6 7, 8 9]. even is just split into twos.
-    #     '''
-    #     stack = []
-    #     i = 0
-    #     depth = int(np.floor(np.log2(self.num_leaves)))
-    #     while len(stack) < self.num_leaves - 1:
-    #         level = []
-    #         for j in range(2**i):
-    #             level.append(2**i-1+j)
-    #             if len(level) + len(stack) == self.num_leaves - 1: break
-    #         stack = level + stack
-    #         i += 1
-
-    #     pair_map = {}
-    #     node_map = {}
-    #     num_nodes_before_single = 2*int(self.num_leaves - 2**np.floor(np.log2(self.num_leaves)))
-    #     popped_nodes = set()
-    #     i = 0
-    #     while i < self.num_leaves:
-    #         node = stack.pop(0)
-    #         # check if all of node's children have been popped. If they have, we can skip to next node.
-    #         if node * 2 + 1 in popped_nodes and node * 2 + 2 in popped_nodes: continue
-    #         popped_nodes.add(node)
-    #         if i == num_nodes_before_single and self.num_leaves % 2 == 1:
-    #             pair_map[i] = None
-    #             node_map[i] = node
-    #             i += 1
-    #         else:
-    #             pair_map[i] = i+1
-    #             pair_map[i+1] = i
-    #             node_map[i] = node
-    #             node_map[i+1] = node
-    #             i += 2
-    #     self.pair_map = pair_map
-    #     self.node_map = node_map
-
-    # def get_pruned_features(self):
-    #     '''
-    #     For a pruned tree, return important pruned features:
-    #     lin_models, comparators, layers, alphas, paths.
-
-    #     Choose the leaf to prune by picking the leaves with the least visitations
-    #     '''
-    #     import ipdb; ipdb.set_trace()
-    #     if self.num_leaves == 1: return # cannot prune any more leaves
-    #     num_remove_leaves = int(np.ceil(self.num_leaves * self.morph_factor))
-    #     if num_remove_leaves >= self.num_leaves: num_remove_leaves = self.num_leaves - 1
-    #     remove_idcs = np.argsort(self.visitations)[:num_remove_leaves]
-    #     pruned_idcs = np.argsort(self.visitations)[num_remove_leaves:]
-        
-    #     lin_models = []
-    #     for idx in pruned_idcs:
-    #         lin_models.append(self.lin_models[idx])
-    #     lin_models = nn.ModuleList(lin_models)
-    #     # n-1 shape
-    #     # for a leaf we want to remove, we have to edit a comparator weight. If we're removing both left and right leaves
-    #     # of a comparator, we must remove that comparator itself
-    #     # bigger comparator mean more chance to go right. small comparator means more chance to go left.
-
-    #     # [c1 c2 c3]; [0 1 2 3]. 
-    #     # 1. Remove idx 2
-    #     # make c3 huge to go right.
-    #     # 2. Remove idx 2, then 3 later on.
-    #     # make c3 huge to go right. Later, see that 2 was already removed so remove c3 and make c1 small to go left.
-
-    #     # [c1 c2 c3 c4]; [0 1, 2, 3 4].
-    #     # 1. Remove idx 2
-    #     # make c2 small to go left.
-    #     # 2. Remove idx 2 and 3
-    #     # make c2 small to go left and make c3 huge to go right
-    #     # 3. Remove idx 3 and 4
-    #     # remove c3 and make c1 small to go left.
-
-    #     # [c1 c2 c3 c4 c5]; [0 1, 2 3, 4 5]
-    #     # it's a stack but reversed
-
-    #     # ifpower of 2, then the # of pairs maps directly to the last # of nodes
-
-    #     # count if all the children of a node were visited.
-
-    #     # only remove one leaf out of a pair at a time.
-    #     idcs = []
-    #     for idx in remove_idcs:
-    #         if self.pair_map[idx] in idcs:
-    #             continue
-    #         idcs.append(idx)
-    #     remove_idcs = idcs
-
-
-    #     # these need the node idcs not the leaf idcs.
-    #     comparators = self.comparators[pruned_idcs].copy()
-    #     layers = self.layers[pruned_idcs].copy()
-    #     alpha = self.alpha[pruned_idcs].copy()
-        
-    #     # this paths is the hardest probably
-    #     # self.left_path_sigs # (n-1, n) shape
-    #     # self.right_path_Sigs
