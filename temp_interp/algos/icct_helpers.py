@@ -131,12 +131,115 @@ def find_children(node, leaves, current_depth):
     if not right_child_is_leaf:
         find_children(right_child, right_subtree, current_depth + 1)
 
+def compute_entropy(input: []):
+    """
+    Computes the entropy of a list of probabilities
+    :param input: list of probabilities
+    :return: entropy
+    """
+    return -np.sum([p * np.log(p) for p in input])
+
+def logits_to_probs(logits): # TODO: this seems to be for discrete actions -> yes it's for overcooked
+    """
+    Converts logits to probabilities
+    :param logits: list of logits
+    :return: list of probabilities
+    """
+    return [np.exp(logit) / np.sum(np.exp(logits)) for logit in logits]
+
+def deepen_icct(tree, device='cpu'):
+    max_entropy = float('-inf')
+    leaf_index = -1
+
+    # Method 1: find leaf w/ max entropy # TODO: Since we don't really instantiate leaf info correctly, this entropy may be hugely wrong
+    # for i, leaf in enumerate(tree.leaf_init_information):
+    #     entropy = compute_entropy(logits_to_probs(leaf[2]))
+    #     if entropy > max_entropy:
+    #         max_entropy = entropy
+    #         leaf_index = i
+    # if leaf_index == -1: return
+
+    # Method 2: find leaf w/ max visitations
+    leaf_index = int(np.argmax(tree.visitations))
+
+    old_leaf_info = copy.deepcopy(tree.leaf_init_information)
+    old_weights = tree.layers  # Get the weights out
+    old_comparators = tree.comparators  # get the comparator values out
+    old_alphas = tree.alpha
+    old_submodels = tree.lin_models
+
+    leaf_information = old_leaf_info[leaf_index]  # get the old leaf init info out
+    left_path = leaf_information[0]
+    right_path = leaf_information[1]
+
+    new_weight = np.random.normal(scale=0.2, size=old_weights[0].size()[0])
+    new_comp = np.random.normal(scale=0.2, size=old_comparators[0].size()[0])
+    new_alpha = np.random.normal(scale=1, size=1)
+    new_submodel = torch.nn.Linear(tree.input_dim, tree.output_dim)
+
+    new_leaf1 = np.random.normal(scale=0.2, size=tree.output_dim).tolist()
+    new_leaf2 = np.random.normal(scale=0.2, size=tree.output_dim).tolist()
+
+    new_weights = [weight.detach().clone().data.cpu().numpy() for weight in old_weights]
+    new_weights.append(new_weight)  # Add it to the list of nodes
+    new_comps = [comp.detach().clone().data.cpu().numpy() for comp in old_comparators]
+    new_comps.append(new_comp)
+    new_alphas = [alpha.detach().clone().data.cpu().numpy() for alpha in old_alphas]
+    new_alphas.append(new_alpha)
+    new_submodels = [old_submodels[i].cpu() for i in range(len(old_submodels))]
+    new_submodels.append(new_submodel)
+    # Add it to the list of nodes
+
+    new_weights = np.array(new_weights)
+    new_comps = np.array(new_comps)
+    new_alphas = np.array(new_alphas)
+    new_submodels = torch.nn.ModuleList(new_submodels)
+
+    new_node_ind = len(new_weights) - 1  # Remember where we put it
+
+    # Create the paths, which are copies of the old path but now with a left / right at the new node
+    new_leaf1_left = left_path.copy()
+    new_leaf1_right = right_path.copy()
+    new_leaf2_left = left_path.copy()
+    new_leaf2_right = right_path.copy()
+    # Leaf 1 goes left at the new node, leaf 2 goes right
+    new_leaf1_left.append(new_node_ind)
+    new_leaf2_right.append(new_node_ind)
+
+    new_leaf_information = old_leaf_info
+    new_leaf_information.append([new_leaf1_left, new_leaf1_right, new_leaf1])
+    new_leaf_information.append([new_leaf2_left, new_leaf2_right, new_leaf2])
+    # Remove the old leaf
+    del new_leaf_information[leaf_index]
+
+    new_network = ICCT(input_dim=tree.input_dim, 
+                    output_dim=tree.output_dim, 
+                    weights=new_weights, 
+                    comparators=new_comps,
+                    leaves=new_leaf_information, 
+                    alpha=new_alphas, 
+                    paths=None, # may not need
+                    submodels=new_submodels,
+                    use_individual_alpha=tree.use_individual_alpha, 
+                    device=device,
+                    use_submodels=tree.use_submodels,
+                    hard_node=tree.hard_node,
+                    argmax_tau=tree.argmax_tau,
+                    sparse_submodel_type=tree.sparse_submodel_type,
+                    fs_submodel_version=tree.fs_submodel_version,
+                    l1_hard_attn=tree.l1_hard_attn,
+                    num_sub_features=tree.num_sub_features,
+                    use_gumbel_softmax=tree.use_gumbel_softmax,
+                    alg_type=tree.alg_type)
+    return new_network
+
 def prune_icct(tree, device='cpu'):
     leaf_info = tree.leaf_init_information
     leaves_with_idx = copy.deepcopy([(leaf_idx, leaf_info[leaf_idx]) for leaf_idx in range(len(leaf_info))])
     root = Node(find_root(leaves_with_idx), 0)
     find_children(root, leaves_with_idx, current_depth=1)
 
+    # get the leaf/node to prune
     pruned_leaf = int(np.argmin(tree.visitations))
     node_2_leaf, leaf_2_node = node_leaf_map(len(leaf_info))
     decision_node_index = leaf_2_node[pruned_leaf]
@@ -282,10 +385,6 @@ def prune_icct(tree, device='cpu'):
                     num_sub_features=tree.num_sub_features,
                     use_gumbel_softmax=tree.use_gumbel_softmax,
                     alg_type=tree.alg_type)
-
-    # TODO: freeze all weights except the ones correlated to the pruned leaf and node
-    # This may not be possible due to how the graph works.
-
     return new_network
 
 def node_leaf_map(num_leaves):
