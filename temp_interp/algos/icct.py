@@ -65,7 +65,6 @@ class ICCT(nn.Module):
         self.leaf_init_information = leaves
         self.hard_node = hard_node
         self.argmax_tau = argmax_tau
-        self.depth = 0
 
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -86,9 +85,7 @@ class ICCT(nn.Module):
         self.init_alpha(alpha)
         self.init_paths(paths)
         self.init_leaves()
-        # self.init_pairs() # TODO: comment out for now
         self.sig = nn.Sigmoid()
-        # self.num_leaves = self.layers.size(0) + 1
         
         if self.use_submodels:
             self.init_submodels(submodels) 
@@ -118,12 +115,7 @@ class ICCT(nn.Module):
     def init_comparators(self, comparators):
         if comparators is None:
             comparators = []
-            if type(self.leaf_init_information) is int:
-                depth = int(np.ceil(np.log2(self.leaf_init_information)))
-            else:
-                depth = 4
-            self.depth = depth
-            for i in range(self.leaf_init_information-1):
+            for i in range(self.num_leaves-1): # how does this work without causing issues? OH it's b/c it doesn't matter for i does it?
                 comparators.append(np.random.normal(0, 1.0, 1))
         new_comps = torch.tensor(np.array(comparators), dtype=torch.float).to(self.device)
         new_comps.requires_grad = True
@@ -132,11 +124,7 @@ class ICCT(nn.Module):
     def init_weights(self, weights):
         if weights is None:
             weights = []
-            if type(self.leaf_init_information) is int:
-                depth = int(np.ceil(np.log2(self.leaf_init_information)))
-            else:
-                depth = 4
-            for i in range(self.leaf_init_information-1):
+            for i in range(self.num_leaves-1):
                 weights.append(np.random.rand(self.input_dim))
 
         new_weights = torch.tensor(np.array(weights), dtype=torch.float).to(self.device)
@@ -147,11 +135,7 @@ class ICCT(nn.Module):
         if alpha is None:
             if self.use_individual_alpha:
                 alphas = []
-                if type(self.leaf_init_information) is int:
-                    depth = int(np.ceil(np.log2(self.leaf_init_information)))
-                else:
-                    depth = 4
-                for i in range(self.leaf_init_information-1):
+                for i in range(self.num_leaves-1):
                     alphas.append([1.0])
             else:
                 alphas = [1.0]
@@ -162,65 +146,6 @@ class ICCT(nn.Module):
         self.alpha = nn.Parameter(self.alpha, requires_grad=True)
 
     def init_paths(self, paths):
-        '''
-        # at current comparator, which node can you still reach if you take l/r right now?
-        with 3:
-            l = [1 1 0
-                1 0 0]
-            r = [0 0 1
-                0 1 0]
-
-        with 4:
-            l = [1 1 0 0
-                1 0 0 0
-                0 0 1 0]
-            r = [0 0 1 1
-                0 1 0 0
-                0 0 0 1]
-
-        5 should be:
-            l = [1 1 1 0 0
-                1 1 0 0 0
-                0 0 0 1 0
-                1 0 0 0 0]
-            r = [0 0 0 1 1
-                0 0 1 0 0 
-                0 0 0 0 1
-                0 1 0 0 0]
-
-        6 should be:
-            l = [1 1 1 1 0 0; m=[0:x=6-floor(log2(6))], n=[x:]
-                1 1 0 0 0 0; a=m[0:ceil(len(m)/2)]; b=m[ceil(len(m)/2):]
-                0 0 0 0 1 0; n[0:ceil(len(m)/2)]
-                1 0 0 0 0 0; a[0:ceil(len(a)/2)]
-                0 0 1 0 0 0]; b[0:ceil(len(b)/2)]
-                # if one of the matrix has len 2, then no more appending
-
-            r = [0 0 0 0 1 1
-                0 0 1 1 0 0
-                0 0 0 0 0 1
-                0 1 0 0 0 0
-                0 0 0 1 0 0]
-
-        9 should be:
-            l = [1 1 1 1 1 0 0 0 0
-                 1 1 1 0 0 0 0 0 0 
-                 0 0 0 0 0 1 1 0 0
-                 1 1 0 0 0 0 0 0 0
-                 0 0 0 1 0 0 0 0 0
-                 0 0 0 0 0 1 0 0 0
-                 0 0 0 0 0 0 0 1 0
-                 1 0 0 0 0 0 0 0 0]
-                
-            r = [0 0 0 0 0 1 1 1 1
-                 0 0 0 1 1 0 0 0 0
-                 0 0 0 0 0 0 0 1 1
-                 0 0 1 0 0 0 0 0 0
-                 0 0 0 0 1 0 0 0 0
-                 0 0 0 0 0 0 1 0 0
-                 0 0 0 0 0 0 0 0 1
-                 0 1 0 0 0 0 0 0 0]
-        '''
         if paths is not None:
             self.left_path_sigs = nn.Parameter(paths[0].to(self.device), requires_grad=False)
             self.right_path_sigs = nn.Parameter(paths[1].to(self.device), requires_grad=False)
@@ -234,22 +159,17 @@ class ICCT(nn.Module):
                     for j in self.leaf_init_information[n][1]:
                         right_branches[j][n] = 1.0
             else:
-                if type(self.leaf_init_information) is int:
-                    low_depth = int(np.floor(np.log2(self.leaf_init_information)))
-                    depth = int(np.ceil(np.log2(self.leaf_init_information)))
-                else:
-                    depth = 4
-                left_branches = torch.zeros((self.leaf_init_information - 1, self.leaf_init_information), dtype=torch.float)
-                right_branches = torch.zeros((self.leaf_init_information - 1, self.leaf_init_information), dtype=torch.float)
+                left_branches = torch.zeros((self.num_leaves - 1, self.num_leaves), dtype=torch.float)
+                right_branches = torch.zeros((self.num_leaves - 1, self.num_leaves), dtype=torch.float)
                 # this variable keeps track of the closest 2nd power
-                closest_second_power = 2**np.floor(np.log2(self.leaf_init_information))
+                closest_second_power = 2**np.floor(np.log2(self.num_leaves))
                 # these idcs only track the left_branch
-                end_idx = int((self.leaf_init_information - closest_second_power) + closest_second_power//2)
+                end_idx = int((self.num_leaves - closest_second_power) + closest_second_power//2)
                 left_branches[0, :end_idx] = 1
                 right_branches[0, end_idx:] = 1
-                queue = [(0, end_idx), (end_idx, self.leaf_init_information)]
+                queue = [(0, end_idx), (end_idx, self.num_leaves)]
                 i = 1
-                while i < self.leaf_init_information - 1:
+                while i < self.num_leaves - 1:
                     m = queue.pop(0)
                     start_idx, end_idx = m[0], m[1]
                     half_idx = int(np.ceil((start_idx + end_idx) / 2))
@@ -268,11 +188,7 @@ class ICCT(nn.Module):
             new_leaves = [leaf[-1] for leaf in self.leaf_init_information]
         else:
             new_leaves = []
-            if type(self.leaf_init_information) is int:
-                # depth = int(np.floor(np.log2(self.leaf_init_information)))
-                depth = int(np.ceil(np.log2(self.leaf_init_information)))
-            else:
-                depth = 4
+            depth = int(np.ceil(np.log2(self.num_leaves)))
 
             last_level = np.arange(2**(depth-1)-1, 2**depth-1)
             going_left = True
