@@ -147,20 +147,28 @@ def logits_to_probs(logits): # TODO: this seems to be for discrete actions -> ye
     """
     return [np.exp(logit) / np.sum(np.exp(logits)) for logit in logits]
 
-def deepen_icct(tree, device='cpu'):
-    max_entropy = float('-inf')
+def deepen_icct(tree, rollout_data, device='cpu'):
+    """
+    Deepens the tree by computing the leaf that has the highest probability and output variance,
+    in other words, a leaf that is picked often but is not confident in its answer.
+    :param tree: the tree
+    :param rollout_data: a batch of rollout data used to evaluate the tree
+    :param device: device used for pytorch
+    """
+    # find the leaf to deepen
     leaf_index = -1
-
-    # Method 1: find leaf w/ max entropy # TODO: Since we don't really instantiate leaf info correctly, this entropy may be hugely wrong
-    # for i, leaf in enumerate(tree.leaf_init_information):
-    #     entropy = compute_entropy(logits_to_probs(leaf[2]))
-    #     if entropy > max_entropy:
-    #         max_entropy = entropy
-    #         leaf_index = i
-    # if leaf_index == -1: return
-
+    # Method 1: find leaf w/ the highest prob and policy gradient variance
+    dictionary = tree.forward_input_compressions(rollout_data.observations, deepening=True)
+    probs = dictionary['probs']
+    leaf_action = dictionary['leaf_action'].transpose(0, 1)
+    action_diff = rollout_data.actions.unsqueeze(1).expand(-1, tree.num_leaves, -1) - leaf_action
+    scaled_action_diff = action_diff * rollout_data.advantages.unsqueeze(1).expand(-1, tree.num_leaves).unsqueeze(-1)
+    action_variance = scaled_action_diff.std(dim=-1)
+    score = (probs * action_variance).mean(dim=0)
+    leaf_idx = torch.argmax(score).item()
     # Method 2: find leaf w/ max visitations
-    leaf_index = int(np.argmax(tree.visitations))
+    # leaf_index = int(np.argmax(tree.visitations))
+    if leaf_index == -1: return
 
     old_leaf_info = copy.deepcopy(tree.leaf_init_information)
     old_weights = tree.layers  # Get the weights out
@@ -234,6 +242,11 @@ def deepen_icct(tree, device='cpu'):
     return new_network
 
 def prune_icct(tree, device='cpu'):
+    """
+    Prune the tree based on the leaf with zero visitations.
+    :param tree: the tree
+    :param device: device used for pytorch
+    """
     leaf_info = tree.leaf_init_information
     leaves_with_idx = copy.deepcopy([(leaf_idx, leaf_info[leaf_idx]) for leaf_idx in range(len(leaf_info))])
     root = Node(find_root(leaves_with_idx), 0)

@@ -405,9 +405,9 @@ class ICCT(nn.Module):
         mus = self.tanh(mus)
         return mus
         
-    def forward_input_compressions(self, input_data, embedding_list=None):
+    def forward_input_compressions(self, input_data, embedding_list=None, deepening=False):
         """
-        Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
+        Return the leaf probabilities outputted by the ICCT-complete to use as a sufficient statistic for the information bottleneck
         
         :param input_data: The observation batch
         :return: The batch of leaf probabilities.
@@ -469,4 +469,10 @@ class ICCT(nn.Module):
             probs = torch.cat((left_path_probs, right_path_probs), dim=1)
             # probs: [batch_size, num_leaves]
             probs = probs.prod(dim=1)
-            return probs
+            if not deepening: return probs # for evaluation / analysis
+        
+            # for deepening a tree
+            output = torch.zeros((self.num_leaves, input_data.size(0), self.output_dim)).to(self.device)
+            for e, i in enumerate(self.lin_models):
+                output[e] = i(input_copy)
+            return {'probs': probs, 'leaf_action': output}
