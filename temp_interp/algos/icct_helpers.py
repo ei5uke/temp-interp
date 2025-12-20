@@ -156,7 +156,7 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     :param device: device used for pytorch
     """
     # find the leaf to deepen
-    leaf_index = -1
+    deepened_leaf = -1
     # Method 1: find leaf w/ the highest prob and policy gradient variance
     dictionary = tree.forward_input_compressions(rollout_data.observations, deepening=True)
     probs = dictionary['probs']
@@ -165,10 +165,9 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     scaled_action_diff = action_diff * rollout_data.advantages.unsqueeze(1).expand(-1, tree.num_leaves).unsqueeze(-1)
     action_variance = scaled_action_diff.std(dim=-1)
     score = (probs * action_variance).mean(dim=0)
-    leaf_idx = torch.argmax(score).item()
+    deepened_leaf = torch.argmax(score).item()
     # Method 2: find leaf w/ max visitations
-    # leaf_index = int(np.argmax(tree.visitations))
-    if leaf_index == -1: return
+    # deepened_leaf = int(np.argmax(tree.visitations))
 
     old_leaf_info = copy.deepcopy(tree.leaf_init_information)
     old_weights = tree.layers  # Get the weights out
@@ -176,17 +175,15 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     old_alphas = tree.alpha
     old_submodels = tree.lin_models
 
-    leaf_information = old_leaf_info[leaf_index]  # get the old leaf init info out
+    leaf_information = old_leaf_info[deepened_leaf]  # get the old leaf init info out
     left_path = leaf_information[0]
     right_path = leaf_information[1]
 
     new_weight = np.random.normal(scale=0.2, size=old_weights[0].size()[0])
     new_comp = np.random.normal(scale=0.2, size=old_comparators[0].size()[0])
     new_alpha = np.random.normal(scale=1, size=1)
-    new_submodel = torch.nn.Linear(tree.input_dim, tree.output_dim)
-
-    new_leaf1 = np.random.normal(scale=0.2, size=tree.output_dim).tolist()
-    new_leaf2 = np.random.normal(scale=0.2, size=tree.output_dim).tolist()
+    new_submodel1 = old_submodels[deepened_leaf].cpu()
+    new_submodel2 = old_submodels[deepened_leaf].cpu()
 
     new_weights = [weight.detach().clone().data.cpu().numpy() for weight in old_weights]
     new_weights.append(new_weight)  # Add it to the list of nodes
@@ -195,7 +192,10 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     new_alphas = [alpha.detach().clone().data.cpu().numpy() for alpha in old_alphas]
     new_alphas.append(new_alpha)
     new_submodels = [old_submodels[i].cpu() for i in range(len(old_submodels))]
-    new_submodels.append(new_submodel)
+    new_submodels.append(new_submodel1)
+    new_submodels.append(new_submodel2)
+    # Remove the old leaf
+    del new_submodels[deepened_leaf]
     # Add it to the list of nodes
 
     new_weights = np.array(new_weights)
@@ -215,10 +215,10 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     new_leaf2_right.append(new_node_ind)
 
     new_leaf_information = old_leaf_info
-    new_leaf_information.append([new_leaf1_left, new_leaf1_right, new_leaf1])
-    new_leaf_information.append([new_leaf2_left, new_leaf2_right, new_leaf2])
+    new_leaf_information.append([new_leaf1_left, new_leaf1_right])
+    new_leaf_information.append([new_leaf2_left, new_leaf2_right])
     # Remove the old leaf
-    del new_leaf_information[leaf_index]
+    del new_leaf_information[deepened_leaf]
 
     new_network = ICCT(input_dim=tree.input_dim, 
                     output_dim=tree.output_dim, 
@@ -238,7 +238,8 @@ def deepen_icct(tree, rollout_data, device='cpu'):
                     l1_hard_attn=tree.l1_hard_attn,
                     num_sub_features=tree.num_sub_features,
                     use_gumbel_softmax=tree.use_gumbel_softmax,
-                    alg_type=tree.alg_type)
+                    alg_type=tree.alg_type,)
+                    # morph_debug_flag=[tree.left_path_sigs, tree.right_path_sigs, deepened_leaf, "deepening"]) # debugging
     return new_network
 
 def prune_icct(tree, device='cpu'):
@@ -350,7 +351,7 @@ def prune_icct(tree, device='cpu'):
             adjusted_node_idx = old_idx_to_new_idx[old_node_idx]
             right_ancestors.append(adjusted_node_idx)
 
-        new_leaf_info_adjusted_ancestors.append([left_ancestors, right_ancestors, leaf[2]])
+        new_leaf_info_adjusted_ancestors.append([left_ancestors, right_ancestors])
 
     # we need to filter out the decision nodes that we are pruning
     # from the prior weights, comparators, and alphas
@@ -397,7 +398,8 @@ def prune_icct(tree, device='cpu'):
                     l1_hard_attn=tree.l1_hard_attn,
                     num_sub_features=tree.num_sub_features,
                     use_gumbel_softmax=tree.use_gumbel_softmax,
-                    alg_type=tree.alg_type)
+                    alg_type=tree.alg_type,)
+                    # morph_debug_flag=[tree.left_path_sigs, tree.right_path_sigs, pruned_leaf, "pruning"])
     return new_network
 
 def node_leaf_map(num_leaves):
