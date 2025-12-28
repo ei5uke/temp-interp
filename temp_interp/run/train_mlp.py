@@ -165,10 +165,11 @@ if __name__ == "__main__":
 
         policy_kwargs = {
             'features_extractor_class': features_extractor,
-            'ddt_kwargs': ddt_kwargs,
-            'net_arch': {'vf': [64, 64]},
+            # 'ddt_kwargs': ddt_kwargs,
+            'net_arch': {'vf': [64, 64], 'pi': [64, 64]},
             'activation_fn': th.nn.Tanh,
             'time_horizon': config.time_horizon,
+            'abstraction_type': args.abstraction_type,
         }
         if args.abstraction_type == 'temp-ensemble': policy_kwargs['decay'] = config.decay
         policy_name = 'MLPPolicy'

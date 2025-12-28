@@ -18,7 +18,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.preprocessing import get_action_dim
 
-from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy
+from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy, MLPPolicyAC
 from temp_interp.rl_helpers.buffers import TemporalRolloutBuffer
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
@@ -81,11 +81,12 @@ class PPO(OnPolicyAlgorithm):
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "ICCTPolicy": ICCTPolicy,
+        "MLPPolicy": MLPPolicyAC,
     }
 
     def __init__(
         self,
-        policy: Union[str, type[ICCTPolicy]],
+        policy: Union[str, type[ICCTPolicy], type[MLPPolicyAC]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
@@ -176,16 +177,20 @@ class PPO(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.method = method
         self.curriculum_coef = curriculum_coef
-
+        self.policy_name = policy
         if _init_setup_model:
             self._setup_model()
 
         # project actions, states, and leaf probabilities to the same dimension (the average of the dimension spaces)
-        self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+        if policy == "ICCTPolicy" or (isinstance(policy, type) and issubclass(policy, ICCTPolicy)):
+            self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+        else:
+            self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
         self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
         self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
         self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
-        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+        if policy == "ICCTPolicy" or (isinstance(policy, type) and issubclass(policy, ICCTPolicy)):
+            self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
 
         # only add if we are storing the flattened action to the buffer instead 
         # of the temporal ensemble action
@@ -418,8 +423,8 @@ class PPO(OnPolicyAlgorithm):
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
-                # temporal loss only if abstraction is temp-pred
-                if self.policy.abstraction_type == 'temp-pred':
+                # temporal loss only if abstraction is temp-pred and horizon > 1
+                if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1:
                     # temporal prediction loss 1 (log prob)
                     curr_action = rollout_data.actions.clone()
                     curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.policy.time_horizon)
@@ -492,16 +497,19 @@ class PPO(OnPolicyAlgorithm):
             self.logger.record(f"train/I(S;A)", self._estimate_mutual_info(s_proj, a_proj))
             self.logger.record(f"train/I(S;AC)", self._estimate_mutual_info(s_proj, ac_proj))
             # information bottleneck no layers
-            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-            t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-            self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
-            self.logger.record(f"train/I(T;A)", self._estimate_mutual_info(t_proj, a_proj))
-            self.logger.record(f"train/I(T;AC)", self._estimate_mutual_info(t_proj, ac_proj))
+
+            if self.policy_name == "ICCTPolicy" or (isinstance(self.policy, type) and issubclass(self.policy, ICCTPolicy)):
+                leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+                t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+                self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
+                self.logger.record(f"train/I(T;A)", self._estimate_mutual_info(t_proj, a_proj))
+                self.logger.record(f"train/I(T;AC)", self._estimate_mutual_info(t_proj, ac_proj))
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        if self.policy.abstraction_type == 'temp-pred': self.logger.record("train/pred_loss", np.mean(pred_losses))
+        if self.policy.abstraction_type == 'temp-pred' and pred_losses:
+            self.logger.record("train/pred_loss", np.mean(pred_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
         # self.logger.record("train/ratios", np.mean(ratios)) # debugging
         # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
