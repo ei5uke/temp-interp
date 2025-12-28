@@ -163,9 +163,13 @@ if __name__ == "__main__":
         else:
             args.fs_submodel_version = 0
 
+        ddt_kwargs = {
+            'num_leaves': 0,
+            'ddt_lr': config.lr,
+        }
         policy_kwargs = {
             'features_extractor_class': features_extractor,
-            # 'ddt_kwargs': ddt_kwargs,
+            'ddt_kwargs': ddt_kwargs,
             'net_arch': {'vf': [64, 64], 'pi': [64, 64]},
             'activation_fn': th.nn.Tanh,
             'time_horizon': config.time_horizon,

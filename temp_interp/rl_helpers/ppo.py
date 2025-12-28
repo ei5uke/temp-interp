@@ -182,14 +182,14 @@ class PPO(OnPolicyAlgorithm):
             self._setup_model()
 
         # project actions, states, and leaf probabilities to the same dimension (the average of the dimension spaces)
-        if policy == "ICCTPolicy" or (isinstance(policy, type) and issubclass(policy, ICCTPolicy)):
+        if self.policy_name == "ICCTPolicy" or isinstance(self.policy, ICCTPolicy):
             self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
         else:
             self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
         self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
         self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
         self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
-        if policy == "ICCTPolicy" or (isinstance(policy, type) and issubclass(policy, ICCTPolicy)):
+        if self.policy_name == "ICCTPolicy" or isinstance(self.policy, ICCTPolicy):
             self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
 
         # only add if we are storing the flattened action to the buffer instead 
@@ -334,7 +334,7 @@ class PPO(OnPolicyAlgorithm):
         # curr_level = 1 + int((1 - self._current_progress_remaining) * self.policy.time_horizon) # 1->0
 
         entropy_losses = []
-        pg_losses, value_losses = [], []
+        pg_losses, value_losses, total_losses = [], [], []
         if self.policy.abstraction_type == 'temp-pred': pred_losses = []
         ratios = []
         clip_fractions = []
@@ -422,6 +422,7 @@ class PPO(OnPolicyAlgorithm):
                 entropy_losses.append(entropy_loss.item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                total_losses.append(loss.item())
 
                 # temporal loss only if abstraction is temp-pred and horizon > 1
                 if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1:
@@ -498,7 +499,7 @@ class PPO(OnPolicyAlgorithm):
             self.logger.record(f"train/I(S;AC)", self._estimate_mutual_info(s_proj, ac_proj))
             # information bottleneck no layers
 
-            if self.policy_name == "ICCTPolicy" or (isinstance(self.policy, type) and issubclass(self.policy, ICCTPolicy)):
+            if self.policy_name == "ICCTPolicy" or isinstance(self.policy, ICCTPolicy):
                 leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
                 t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
                 self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
@@ -514,7 +515,7 @@ class PPO(OnPolicyAlgorithm):
         # self.logger.record("train/ratios", np.mean(ratios)) # debugging
         # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         # self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/loss", np.mean(total_losses))
         # self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())

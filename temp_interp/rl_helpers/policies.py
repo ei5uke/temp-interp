@@ -77,6 +77,7 @@ class TemporalActorCriticPolicy(BasePolicy):
         time_horizon: int = 3,
         abstraction_type: str = 'temp-pred',
         decay: float = 0.0,
+        **kwargs
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
