@@ -21,7 +21,7 @@ from stable_baselines3.common.preprocessing import get_action_dim
 
 from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy
 from temp_interp.rl_helpers.buffers import TemporalRolloutBuffer
-from temp_interp.algos.icct_helpers import prune_icct
+from temp_interp.algos.icct_helpers import deepen_icct, prune_icct
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
@@ -115,6 +115,7 @@ class PPO(OnPolicyAlgorithm):
         _init_setup_model: bool = True,
         method: str = 'pred',
         curriculum_coef: Union[float, Schedule] = 1.0,
+        epsilon: float = 0.05, # the minimum average gradient that must be observed to incentivize morph.
     ):
         super().__init__(
             policy,
@@ -188,9 +189,11 @@ class PPO(OnPolicyAlgorithm):
         self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
         self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
         self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
-        if self.policy.action_net.num_leaves > 2: self.new_leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves - 1, self.dim_common).to(device)
         self.policy_complexities = []
+
+        # deepening / pruning variables
         self.last_morph_timestep = 0
+        self.epsilon = epsilon
 
         # only add if we are storing the flattened action to the buffer instead 
         # of the temporal ensemble action
@@ -219,7 +222,9 @@ class PPO(OnPolicyAlgorithm):
         """
         Clear policy's past information, then collect rollouts
         """
-        self.policy.action_net.visitations = np.zeros(self.policy.action_net.num_leaves)
+        # we can either clear this before each rollout, or implicitly clear it when the tree gets replaced by the deepened/pruned one
+        # self.policy.action_net.visitations = np.zeros(self.policy.action_net.num_leaves)
+
         if self.policy.abstraction_type == 'temp-ensemble': self.policy.clear_lists()
 
         assert self._last_obs is not None, "No previous observation was provided"
@@ -343,7 +348,7 @@ class PPO(OnPolicyAlgorithm):
         # deepen / prune the tree
         method = self._check_morph()
         if method is not None:
-            self._morph(method, clip_range)
+            self._morph(method)
 
         continue_training = True
         # train for n_epochs epochs
@@ -468,6 +473,10 @@ class PPO(OnPolicyAlgorithm):
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
     def _policy_loss_helper(self, action_net, rollout_data, log_prob, clip_range):
+        """
+        Calculates policy gradient loss, modularized code.
+        """
+        
         # Normalize advantage
         advantages = rollout_data.advantages
         # Normalization does not make sense if mini batchsize == 1, see GH issue #325
@@ -520,9 +529,12 @@ class PPO(OnPolicyAlgorithm):
         return losses
 
     def _estimate_mutual_info(self, proj_A, proj_B, temp=0.1):
-        '''
+        """
         Estimate Mutual information using InfoNCELoss.
-        '''
+        
+        :param proj_A: the projection of the first vector to a common space.
+        :param proj_B: the projection of the second vector to a common space.
+        """
         labels = th.arange(self.batch_size).to(proj_A.device)  # positive pairs on diagonal
         similarity = th.matmul(proj_A, proj_B.T) / temp
         loss_A_B = F.cross_entropy(similarity, labels)
@@ -530,110 +542,62 @@ class PPO(OnPolicyAlgorithm):
         loss = (loss_A_B + loss_B_A) / 2
         return np.log(self.batch_size) - loss.cpu().item()
 
-    def _check_morph(self, min_headstart=500000, min_timesteps=50000, epsilon=0.1):
-        '''
+    def _check_morph(self, min_headstart=10000, min_timesteps=1000, min_evaluations=4):
+    # def _check_morph(self, min_headstart=1000, min_timesteps=500, min_evaluations=1): # debugging
+        """
         Check whether we should morph (deepen or prune) the tree. Return whether to deepen or prune if enough timesteps 
         have passed and if the policy complexities have, on-average, been increasing / decreasing by more than epsilon.
 
         :param timesteps: the current number of timesteps completed in PPO since the last morph step.
         :param min_headstart: the minimum number of timesteps before we can even allow morph.
         :param min_timesteps: the minimum number of timesteps between each morph session.
-        :param epsilon: the minimum average gradient that must be observed to incentivize morph.
-        '''
-        print(self.policy.action_net.visitations) # debugging
-        # print(self.num_timesteps, min_headstart, self.num_timesteps - min_timesteps, self.last_morph_timestep)
-        if self.num_timesteps > min_headstart and (self.num_timesteps - min_timesteps) > self.last_morph_timestep: # TODO: we have to add some other minimum timestep to make sure the model has some learning epochs first
-            # trend = np.mean(np.gradient(self.policy_complexities))
-            # if trend - epsilon > 0:
-            #     return 'deepen'
-            # elif trend + epsilon < 0 and self.policy.action_net.num_leaves > 1:
-            #     return 'prune'
-
-            # TODO: something like a leaf has 0 visitations or the magnitude between it and the next minimum is suuuuper huge. We have it to 0 for now but it may not be good.
-            # print(self.policy.action_net.num_leaves, np.min(self.policy.action_net.visitations))
-            if self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) == 0: # let min number of leaves as 2 b/c 1 has bugs
+        :param min_evaluations: the minimum number of policy complexity evaluations performed before morphing
+        """
+        print(f"visitations: {self.policy.action_net.visitations}", flush=True)
+        if self.num_timesteps > min_headstart and (self.num_timesteps - min_timesteps) > self.last_morph_timestep and len(self.policy_complexities) > min_evaluations:
+            trend = np.mean(np.gradient(self.policy_complexities))
+            print(f"trend: {trend}", flush=True)
+            if trend - self.epsilon > 0:
+                self.policy_complexities = []
+                return 'deepen'
+            # elif trend + self.epsilon < 0 and self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) == 0:
+            elif self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) == 0: # prune anytime we have unvisited leaves and we don't deepen.
+                self.policy_complexities = []
                 return 'prune'
+
+            # # debugging
+            # self.policy_complexities = []
+            # return 'deepen'
         return None
 
-    def _morph(self, method, clip_range, epsilon=1e-4):
-        '''
+    def _morph(self, method):
+        """
         Deepen or prune the tree.
 
-        :param epsilon: minimum entropy difference that must be observed to incentivize morph.
-        '''
+        :param method: whether to deepen or prune.
+        """
 
         if method == 'deepen':
-            # TODO
-            # this new policy must have the same weights as the old policy, but with more leaves (not necessarily a new depth)
-            # then, the new added leaves must be given some weight too. Generally, splitting it is how regular DTs work, but
-            # in ICCT, they train the new policy for a few epochs as well.
-            pass
+            print("***Deepening***", flush=True)
+            rollout_data = next(self.rollout_buffer.get(self.batch_size)) # get a random batch to test
+            deepened_tree = deepen_icct(self.policy.action_net, rollout_data, self.device).to(self.device)
+            assert deepened_tree is not None
+            self.policy.new_action_net = deepened_tree
         elif method == 'prune':
-            print("***Trying to prune***")
+            print("***Pruning***", flush=True)
             pruned_tree = prune_icct(self.policy.action_net, self.device).to(self.device)
             self.policy.new_action_net = pruned_tree
-            pruned_optimizer = type(self.policy.optimizer)(self.policy.new_action_net.parameters(), **self.policy.optimizer.defaults)
-            curr_optimizer_lr = self.policy.optimizer.param_groups[0]['lr']
-            pruned_optimizer.param_groups[0]['lr'] = curr_optimizer_lr
-
-        # # Finetune the new policy on a batch
-        # for epoch in range(self.n_epochs):
-        #     i = 0
-        #     for rollout_data in self.rollout_buffer.get(self.batch_size):
-        #         actions = rollout_data.actions
-        #         if isinstance(self.action_space, spaces.Discrete):
-        #             # Convert discrete action from float to long
-        #             actions = rollout_data.actions.long().flatten()
-
-        #         # regular tree # we may want to also finetune the old tree
-        #         # _, log_prob, _ = self.policy.evaluate_actions(rollout_data.observations, actions)
-        #         # losses = self._policy_loss_helper(self.policy.action_net, rollout_data, log_prob, clip_range)
-        #         # loss = losses['policy_loss']
-        #         # if self.policy.abstraction_type == 'temp-pred': loss += losses['temp_pred_loss']
-        #         # self.policy.optimizer.zero_grad()
-        #         # loss.backward()
-        #         # th.nn.utils.clip_grad_norm_(self.policy.action_net.parameters(), self.max_grad_norm)
-        #         # self.policy.optimizer.step()
-
-        #         # morphed tree
-        #         _, log_prob, _ = self.policy.evaluate_actions(rollout_data.observations, actions, True)
-        #         losses = self._policy_loss_helper(self.policy.new_action_net, rollout_data, log_prob, clip_range)
-        #         loss = losses['policy_loss']
-        #         if self.policy.abstraction_type == 'temp-pred': loss += losses['temp_pred_loss']
-        #         morphed_optimizer.zero_grad()
-        #         loss.backward()
-        #         th.nn.utils.clip_grad_norm_(self.policy.new_action_net.parameters(), self.max_grad_norm)
-        #         morphed_optimizer.step()
-        #         i += 1
-        #         if i == 3: break
-
-        # # Calculate entropies
-        # rollout_data = next(self.rollout_buffer.get(self.batch_size)) # get a random batch to test
-        # old_leaf_probs = self.policy.forward_info_bottleneck(rollout_data.observations)
-        # old_t_proj = F.normalize(self.leaf_proj(old_leaf_probs), dim=1)
-        # old_entropy = self._estimate_mutual_info(old_t_proj, old_t_proj) # I(T;T) = H(T)
-        # new_leaf_probs = self.policy.forward_info_bottleneck(rollout_data.observations, morphed=True)
-        # new_t_proj = F.normalize(self.new_leaf_proj(new_leaf_probs), dim=1)
-        # new_entropy = self._estimate_mutual_info(new_t_proj, new_t_proj)
-        # print(f"old_entropy: {old_entropy}, new_entropy: {new_entropy}")
-
-        # Compare and morph
-        if method == 'deepen' and old_entropy + epsilon > new_entropy: # generally deepened trees decrease entropy
-            # TODO
-            pass
-        # elif method == 'prune' and old_entropy < new_entropy:   # generally pruned trees increase entropy
-        elif method == 'prune':
-            # make policy less complex
-            self.policy.action_net = self.policy.new_action_net
-            self.last_morph_timestep = self.num_timesteps
-            self.leaf_proj = self.new_leaf_proj
-            if self.policy.new_action_net.num_leaves > 2: self.new_leaf_proj = th.nn.Linear(self.policy.new_action_net.num_leaves - 1, self.dim_common).to(self.device)
-            self.policy.optimizer = type(self.policy.optimizer)(self.policy.parameters(), **self.policy.optimizer.defaults)
-            self.policy.optimizer.param_groups[0]['lr'] = curr_optimizer_lr
-            print("***Successfully pruned!!!***")
         else:
-            print("***Did not morph***")
+            print("Error in _morph", flush=True)
+            exit()
+        self.policy.action_net = self.policy.new_action_net
         self.policy.new_action_net = None
+        self.last_morph_timestep = self.num_timesteps
+        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(self.device)
+        curr_optimizer_lr = self.policy.optimizer.param_groups[0]['lr']
+        self.policy.optimizer = type(self.policy.optimizer)(self.policy.parameters(), **self.policy.optimizer.defaults)
+        self.policy.optimizer.param_groups[0]['lr'] = curr_optimizer_lr
+        print("***Completed.***", flush=True)
 
     def learn(
         self: SelfPPO,

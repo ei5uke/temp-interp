@@ -116,35 +116,54 @@ if __name__ == "__main__":
     sweep_config = {
         'method': 'bayes',
         'parameters': {
+            # 'ddt_lr': {
+            #     'distribution': 'uniform',
+            #     'min': 1e-4,
+            #     'max': 9e-4
+            # },
             'ddt_lr': {
-                'distribution': 'uniform',
-                'min': 1e-4,
-                'max': 9e-4
+                'values': [5e-4]
             },
+            # 'lr': {
+            #     'distribution': 'uniform',
+            #     'min': 1e-4,
+            #     'max': 9e-4
+            # },
             'lr': {
-                'distribution': 'uniform',
-                'min': 1e-4,
-                'max': 9e-4
+                'values': [5e-4]
             },
+            # 'clip_range': {
+            #     'distribution': 'uniform',
+            #     'min': 0.1,
+            #     'max': 0.3
+            # },
             'clip_range': {
-                'distribution': 'uniform',
-                'min': 0.1,
-                'max': 0.3
+                'values': [0.2]
             },
             'time_horizon': {
                 'values': [10]
             },
             'num_leaves': {
-                'values': [2, 4, 8, 16, 20]
+                'values': [8]
+            },
+            # 'epsilon': {
+            #     'distribution': 'log_uniform_values',
+            #     'min': 1e-3,
+            #     'max': 0.5,
+            # }
+            'epsilon': {
+                'values': [2e-2]
             },
         }
     }
     if args.abstraction_type == 'temp-ensemble':
         sweep_config['metric'] = {'name': 'eval/mean_reward', 'goal': 'maximize'}
-        sweep_config['parameters']['decay'] = {'distribution': 'uniform', 'min': 0.5, 'max': 1.0}
+        # sweep_config['parameters']['decay'] = {'distribution': 'uniform', 'min': 0.5, 'max': 1.0}
+        sweep_config['parameters']['decay'] = {'values': [0.75]}
     elif args.abstraction_type == 'temp-pred':
         sweep_config['metric'] = {'name': 'eval/mean_total', 'goal': 'maximize'}
-        sweep_config['parameters']['curriculum_coef'] = {'distribution': 'uniform', 'min': 0.1, 'max': 1.0}
+        # sweep_config['parameters']['curriculum_coef'] = {'distribution': 'uniform', 'min': 0.1, 'max': 1.0}
+        sweep_config['parameters']['curriculum_coef'] = {'values': [0.5]}
 
     def train():
         ## wandb setup
@@ -234,10 +253,12 @@ if __name__ == "__main__":
                     verbose=1,
                     device=args.device,
                     curriculum_coef=0 if args.abstraction_type == 'temp-ensemble' else config.curriculum_coef,
-                    seed=args.seed)
+                    seed=args.seed,
+                    epsilon=config.epsilon)
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     
     # sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type)
-    sweep_id = wandb.sweep(sweep_config, project="merge-test")
+    sweep_id = wandb.sweep(sweep_config, project="morph")
+    # sweep_id = wandb.sweep(sweep_config, project="debug")
     wandb.agent(sweep_id, function=train, count=args.num_search)

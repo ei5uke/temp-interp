@@ -7,14 +7,14 @@ curr_user=$(whoami)
 
 python -m temp_interp.run.train \
   --env_name cart \
-  --abstraction_type temp-ensemble \
+  --abstraction_type temp-pred \
   --num_envs 32 \
   --seed 0 \
   --n_steps 2048 \
   --batch_size 256 \
   --gamma 0.99 \
   --ent-coef 0.0 \
-  --eval_freq 10 \
+  --eval_freq 1500 \
   --min_reward 900 \
   --training_steps 2000000 \
   --log_interval 1 \

@@ -29,7 +29,8 @@ class ICCT(nn.Module):
                  num_sub_features = 1,
                  use_gumbel_softmax = False,
                  alg_type = 'ppo',
-                 morph_factor = 0.2):
+                 morph_factor = 0.2,
+                 morph_debug_flag = None):
         super(ICCT, self).__init__()
         """
         Initialize the Interpretable Continuous Control Tree (ICCT)
@@ -58,7 +59,7 @@ class ICCT(nn.Module):
         :param use_gumbel_softmax: whether use gumble softmax instead of the differentiable 
                                    argmax (diff_argmax) proposed in the paper
         :param alg_type: current supported RL methods [PPO]
-        :param morph_factor: the factor to which we either increase or reduce the # of parameters
+        :param morph_debug_flag: stores info for debugging morph()
         """
         self.device = device
         self.num_leaves = leaves if type(leaves) == int else len(leaves)
@@ -78,7 +79,7 @@ class ICCT(nn.Module):
         self.use_gumbel_softmax = use_gumbel_softmax
         self.use_individual_alpha = use_individual_alpha
         self.alg_type = alg_type
-        self.morph_factor = morph_factor
+        self.morph_debug_flag = morph_debug_flag
 
         self.init_comparators(comparators)
         self.init_weights(weights)
@@ -94,23 +95,6 @@ class ICCT(nn.Module):
             self.tanh = nn.Tanh()
 
         self.visitations = np.zeros(self.num_leaves)
-
-    def init_submodels(self, submodels):
-        if submodels is not None and self.sparse_submodel_type != 2: # we only implement this for ICCT-complete
-            self.lin_models = submodels
-        else:
-            if self.sparse_submodel_type != 2:
-                self.lin_models = nn.ModuleList([nn.Linear(self.input_dim, self.output_dim) for _ in range(self.num_leaves)])
-                if self.sparse_submodel_type == 1:
-                    self.leaf_attn = None
-            else:
-                self.sub_scalars = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
-                self.sub_weights = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
-                self.sub_biases = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
-
-                nn.init.xavier_normal_(self.sub_scalars.data)
-                nn.init.xavier_normal_(self.sub_weights.data)
-                nn.init.xavier_normal_(self.sub_biases.data)
             
     def init_comparators(self, comparators):
         if comparators is None:
@@ -149,7 +133,7 @@ class ICCT(nn.Module):
         if paths is not None:
             self.left_path_sigs = nn.Parameter(paths[0].to(self.device), requires_grad=False)
             self.right_path_sigs = nn.Parameter(paths[1].to(self.device), requires_grad=False)
-        else:
+        else: # assume we are deepening/pruning and creating tree from prev tree
             if type(self.leaf_init_information) is list:
                 left_branches = torch.zeros((len(self.layers), len(self.leaf_init_information)), dtype=torch.float)
                 right_branches = torch.zeros((len(self.layers), len(self.leaf_init_information)), dtype=torch.float)
@@ -158,7 +142,7 @@ class ICCT(nn.Module):
                         left_branches[i][n] = 1.0
                     for j in self.leaf_init_information[n][1]:
                         right_branches[j][n] = 1.0
-            else:
+            else: # assume we want a left-heavy tree
                 left_branches = torch.zeros((self.num_leaves - 1, self.num_leaves), dtype=torch.float)
                 right_branches = torch.zeros((self.num_leaves - 1, self.num_leaves), dtype=torch.float)
                 # this variable keeps track of the closest 2nd power
@@ -184,9 +168,7 @@ class ICCT(nn.Module):
             self.right_path_sigs = nn.Parameter(right_branches.to(self.device), requires_grad=False)
 
     def init_leaves(self):
-        if type(self.leaf_init_information) is list:
-            new_leaves = [leaf[-1] for leaf in self.leaf_init_information]
-        else:
+        if type(self.leaf_init_information) is not list:
             new_leaves = []
             depth = int(np.ceil(np.log2(self.num_leaves)))
 
@@ -215,15 +197,24 @@ class ICCT(nn.Module):
                 else:
                     going_left = True
                     leaf_index += 1
-                new_probs = np.random.uniform(0, 1, self.output_dim)  # *(1.0/self.output_dim)
-                self.leaf_init_information.append([sorted(left_path), sorted(right_path), new_probs])
-                new_leaves.append(new_probs)
+                self.leaf_init_information.append([sorted(left_path), sorted(right_path)])
 
-        labels = torch.tensor(np.array(new_leaves), dtype=torch.float).to(self.device)
-        labels.requires_grad = True
-        if not self.use_submodels:
-            self.action_mus = nn.Parameter(labels, requires_grad=True)
-            torch.nn.init.xavier_uniform_(self.action_mus)
+    def init_submodels(self, submodels):
+        if submodels is not None and self.sparse_submodel_type != 2: # we only implement this for ICCT-complete
+            self.lin_models = submodels
+        else:
+            if self.sparse_submodel_type != 2:
+                self.lin_models = nn.ModuleList([nn.Linear(self.input_dim, self.output_dim) for _ in range(self.num_leaves)])
+                if self.sparse_submodel_type == 1:
+                    self.leaf_attn = None
+            else:
+                self.sub_scalars = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
+                self.sub_weights = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
+                self.sub_biases = nn.Parameter(torch.zeros(self.num_leaves, self.output_dim, self.input_dim).to(self.device), requires_grad=True)
+
+                nn.init.xavier_normal_(self.sub_scalars.data)
+                nn.init.xavier_normal_(self.sub_weights.data)
+                nn.init.xavier_normal_(self.sub_biases.data)
 
     def diff_argmax(self, logits, dim=-1):
         tau = self.argmax_tau
@@ -238,10 +229,8 @@ class ICCT(nn.Module):
         index = y_soft.max(dim, keepdim=True)[1]
         y_hard = torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(dim, index, 1.0)
         ret = y_hard - y_soft.detach() + y_soft
-
         return ret     
     
-
     def fs_submodels(self, input):
         ## feature-selection sparse linear sub-controller
         if self.fs_submodel_version == 1:

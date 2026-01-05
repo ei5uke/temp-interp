@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=DDT-AC
-#SBATCH --output=temp_interp/run/logs/ll/pred_hard.log
+#SBATCH --output=temp_interp/run/logs/ll_hard/pred_hard.log
 #SBATCH --cpus-per-task=1
-#SBATCH --time=5:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=rpaleja
 #SBATCH --qos=normal
 #SBATCH --nodes=1
@@ -26,12 +26,12 @@ python -m temp_interp.run.train \
   --ent-coef 0.0 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 10000000 \
+  --training_steps 3000000 \
   --log_interval 1 \
   --gpu \
-  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ICCTComplete_0 \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll_hard/ICCTComplete_0 \
   --use_individual_alpha \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
-  --num_search 5 \
+  --num_search 1 \
