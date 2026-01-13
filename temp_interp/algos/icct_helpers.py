@@ -5,6 +5,7 @@ import sys
 from temp_interp.algos.icct import ICCT
 import torch
 import copy
+from collections import defaultdict
 
 # TODO: unused
 # def convert_to_crisp(fuzzy_model, training_data):
@@ -158,7 +159,7 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     # find the leaf to deepen
     deepened_leaf = -1
     # Method 1: find leaf w/ the highest prob and policy gradient variance
-    dictionary = tree.forward_input_compressions(rollout_data.observations, deepening=True)
+    dictionary = tree.forward_input_compressions(rollout_data.observations.to(torch.float32), deepening=True)
     probs = dictionary['probs']
     leaf_action = dictionary['leaf_action'].transpose(0, 1)
     action_diff = rollout_data.actions.unsqueeze(1).expand(-1, tree.num_leaves, -1) - leaf_action
@@ -217,8 +218,18 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     new_leaf_information = old_leaf_info
     new_leaf_information.append([new_leaf1_left, new_leaf1_right])
     new_leaf_information.append([new_leaf2_left, new_leaf2_right])
+    # if len(set(new_leaf1_left) & set(new_leaf1_right)) > 0: import ipdb; ipdb.set_trace()
+    # if len(set(new_leaf2_left) & set(new_leaf2_right)) > 0: import ipdb; ipdb.set_trace()
     # Remove the old leaf
     del new_leaf_information[deepened_leaf]
+
+    # if len(new_leaf_information) != len(tree.lin_models) + 1:
+    #     import ipdb; ipdb.set_trace()
+    # for leaf in new_leaf_information:
+    #     left = set(leaf[0])
+    #     right = set(leaf[1])
+    #     if len(left & right) > 0:
+    #         import ipdb; ipdb.set_trace()
 
     new_network = ICCT(input_dim=tree.input_dim, 
                     output_dim=tree.output_dim, 
@@ -248,71 +259,41 @@ def prune_icct(tree, device='cpu'):
     :param tree: the tree
     :param device: device used for pytorch
     """
-    leaf_info = tree.leaf_init_information
-    leaves_with_idx = copy.deepcopy([(leaf_idx, leaf_info[leaf_idx]) for leaf_idx in range(len(leaf_info))])
-    root = Node(find_root(leaves_with_idx), 0)
-    find_children(root, leaves_with_idx, current_depth=1)
+    # for leaf in tree.leaf_init_information:
+    #     left = set(leaf[0])
+    #     right = set(leaf[1])
+    #     if len(left & right) > 0:
+    #         import ipdb; ipdb.set_trace()
+
+    leaf_info = copy.deepcopy(tree.leaf_init_information)
 
     # get the leaf/node to prune
     pruned_leaf = int(np.argmin(tree.visitations))
-    node_2_leaf, leaf_2_node = node_leaf_map(len(leaf_info))
+    _, leaf_2_node = node_leaf_map(leaf_info)
     decision_node_index = leaf_2_node[pruned_leaf]
-    pruned_node_children = node_2_leaf[decision_node_index]
-    if len(pruned_node_children) == 1:
+    if decision_node_index in leaf_info[pruned_leaf][0]:
         prune_left = True
     else:
-        if pruned_node_children[0] == pruned_leaf:
-            prune_left = True
-        else:
-            prune_left = False
-    
-    # run BFS to find the node that we would like to prune
-    # which also contains pointers to all of its children
-    node_to_prune = root
-    q = [root]
-    while len(q) > 0:
-        node_to_prune = q.pop(0)
-        # keep traversing until we find the node we want to prune
-        if node_to_prune.idx == decision_node_index:
-            break
-        if node_to_prune.left_child is not None and node_to_prune.left_child.is_leaf is False:
-            q.append(node_to_prune.left_child)
-        if node_to_prune.right_child is not None and node_to_prune.right_child.is_leaf is False:
-            q.append(node_to_prune.right_child)
-
-    # populate the list of descendants of the node we want to prune
-    nodes_to_prune_indices = [node_to_prune.idx]
-    q = []
-    if prune_left:
-        if node_to_prune.left_child is not None and node_to_prune.left_child.is_leaf is False:
-            q = [node_to_prune.left_child]
-    else:
-        if node_to_prune.right_child is not None and node_to_prune.right_child.is_leaf is False:
-            q = [node_to_prune.right_child]
-
-    while len(q) > 0:
-        node = q.pop(0)
-        nodes_to_prune_indices.append(node.idx)
-        if node.left_child is not None and node.left_child.is_leaf is False:
-            q.append(node.left_child)
-        if node.right_child is not None and node.right_child.is_leaf is False:
-            q.append(node.right_child)
-
-    _, pruned_node_left_ancestors, pruned_node_right_ancestors = find_ancestors(root, decision_node_index)
-    pruned_node_left_ancestors = [node.idx for node in pruned_node_left_ancestors]
-    pruned_node_right_ancestors = [node.idx for node in pruned_node_right_ancestors]
+        prune_left = False
+    nodes_to_prune_indices = [decision_node_index]
 
     # prune the leaves that have the decision node in their ancestors
     new_leaf_info_pruned = []
     for leaf_idx, leaf in enumerate(leaf_info):
-        left_ancestors = leaf_info[leaf_idx][0]
-        right_ancestors = leaf_info[leaf_idx][1]
-        if prune_left:
-            if decision_node_index not in left_ancestors:
-                new_leaf_info_pruned.append(leaf)
+        left = set(leaf[0])
+        right = set(leaf[1])
+        # if len(left & right) > 0:
+        #     import ipdb; ipdb.set_trace()
+
+        if decision_node_index != max(left | right):
+            new_leaf_info_pruned.append(leaf)
         else:
-            if decision_node_index not in right_ancestors:
-                new_leaf_info_pruned.append(leaf)
+            if prune_left:
+                if decision_node_index not in left:
+                    new_leaf_info_pruned.append(leaf)
+            else:
+                if decision_node_index not in right:
+                    new_leaf_info_pruned.append(leaf)
 
     # adjust the indices so that they are correct after pruning
     n_decision_nodes, _ = tree.comparators.shape
@@ -328,6 +309,10 @@ def prune_icct(tree, device='cpu'):
     # new leaf info with adjusted ancestors
     new_leaf_info_adjusted_ancestors = []
     for leaf in new_leaf_info_pruned:
+        # left = set(leaf[0])
+        # right = set(leaf[1])
+        # if len(left & right) > 0:
+        #     import ipdb; ipdb.set_trace()
 
         # populate left ancestors
         # we want to remove the decision node from the ancestors
@@ -353,6 +338,15 @@ def prune_icct(tree, device='cpu'):
 
         new_leaf_info_adjusted_ancestors.append([left_ancestors, right_ancestors])
 
+    # if len(new_leaf_info_adjusted_ancestors) != len(tree.lin_models) - 1:
+    #     import ipdb; ipdb.set_trace()
+
+    # for leaf in new_leaf_info_adjusted_ancestors:
+    #     left = set(leaf[0])
+    #     right = set(leaf[1])
+    #     if len(left & right) > 0:
+    #         import ipdb; ipdb.set_trace()
+
     # we need to filter out the decision nodes that we are pruning
     # from the prior weights, comparators, and alphas
     old_weights = tree.layers
@@ -361,20 +355,20 @@ def prune_icct(tree, device='cpu'):
     old_submodels = tree.lin_models
 
     new_weights = [old_weights[i].detach().clone().data.cpu().numpy() \
-                    for i in range(len(old_weights)) if i not in nodes_to_prune_indices]
+                    for i in range(len(old_weights)) if i != decision_node_index]
     new_comps = [old_comparators[i].detach().clone().data.cpu().numpy() \
-                        for i in range(len(old_comparators)) if i not in nodes_to_prune_indices]
+                        for i in range(len(old_comparators)) if i != decision_node_index]
 
     n_alphas = old_alpha.shape
     is_individual_alpha = not len(n_alphas) == 0 and n_alphas[0] > 1
     if is_individual_alpha:
         new_alpha = [old_alpha[i].detach().clone().data.cpu().numpy() \
-                        for i in range(len(old_alpha)) if i not in nodes_to_prune_indices]
+                        for i in range(len(old_alpha)) if i != decision_node_index]
     else:
         new_alpha = [old_alpha.data.item()]
     new_submodels = [old_submodels[i].cpu() \
                        for i in range(len(old_submodels)) if i != pruned_leaf]
-                       
+
     new_weights = np.array(new_weights)
     new_comps = np.array(new_comps)
     new_alpha = np.array(new_alpha)
@@ -402,35 +396,13 @@ def prune_icct(tree, device='cpu'):
                     # morph_debug_flag=[tree.left_path_sigs, tree.right_path_sigs, pruned_leaf, "pruning"])
     return new_network
 
-def node_leaf_map(num_leaves):
-    stack = []
-    i = 0
-    depth = int(np.floor(np.log2(num_leaves)))
-    while len(stack) < num_leaves - 1:
-        level = []
-        for j in range(2**i):
-            level.append(2**i-1+j)
-            if len(level) + len(stack) == num_leaves - 1: break
-        stack = level + stack
-        i += 1
-    
-    node_2_leaf = {}
+def node_leaf_map(leaves):
+    node_2_leaf = defaultdict(list)
     leaf_2_node = {}
-    num_nodes_before_single = 2*int(num_leaves - 2**np.floor(np.log2(num_leaves)))
-    popped_nodes = set()
-    i = 0
-    while i < num_leaves:
-        node = stack.pop(0)
-        # check if all of node's children have been popped. If they have, we can skip to next node.
-        if node * 2 + 1 in popped_nodes and node * 2 + 2 in popped_nodes: continue
-        popped_nodes.add(node)
-        if i == num_nodes_before_single and num_leaves % 2 == 1:
-            node_2_leaf[node] = [i]
-            leaf_2_node[i] = node
-            i += 1
-        else:
-            node_2_leaf[node] = [i, i+1]
-            leaf_2_node[i] = node
-            leaf_2_node[i+1] = node
-            i += 2
+    for i, leaf in enumerate(leaves):
+        left = copy.deepcopy(leaf[0])
+        right = copy.deepcopy(leaf[1])
+        left.extend(right)
+        leaf_2_node[i] = max(left)
+        node_2_leaf[max(left)].append(i)
     return node_2_leaf, leaf_2_node
