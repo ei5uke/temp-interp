@@ -99,6 +99,7 @@ if __name__ == "__main__":
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
     parser.add_argument('--num_search', help='the number of hyperparameter searches', type=int, default=1)
+    parser.add_argument('--time_horizon', help='the time horizon of the temporal abstraction', type=int, default=10)
 
     args = parser.parse_args()
     assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
@@ -132,7 +133,7 @@ if __name__ == "__main__":
                 'max': 0.3
             },
             'time_horizon': {
-                'values': [10]
+                'values': [args.time_horizon]
             },
             'num_leaves': {
                 'values': [2, 4, 8, 16, 20]
@@ -148,7 +149,7 @@ if __name__ == "__main__":
 
     def train():
         ## wandb setup
-        run_name = f"{env_id}__{args.seed}__{int(time.time())}"
+        run_name = f"{env_id}__{args.seed}__LunarLanderICCT_{args.time_horizon}_{int(time.time())}"
         run = wandb.init(name=run_name, sync_tensorboard=True)
         config = wandb.config
 

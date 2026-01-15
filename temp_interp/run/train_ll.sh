@@ -8,13 +8,13 @@ curr_user=$(whoami)
 python -m temp_interp.run.train \
   --env_name lunar \
   --abstraction_type temp-pred \
-  --num_envs 4 \
+  --num_envs 32 \
   --seed 0 \
-  --n_steps 10 \
-  --batch_size 2 \
+  --n_steps 2048 \
+  --batch_size 256 \
   --gamma 0.99 \
   --ent-coef 0.0 \
-  --eval_freq 10 \
+  --eval_freq 1500 \
   --min_reward 225 \
   --training_steps 3000000 \
   --log_interval 1 \
@@ -23,3 +23,5 @@ python -m temp_interp.run.train \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
+  --gpu \
+  --time_horizon 1

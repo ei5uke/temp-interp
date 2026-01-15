@@ -19,6 +19,7 @@ curr_user=$(whoami)
 
 python -m temp_interp.run.train_mlp \
   --env_name lunar \
+  --abstraction_type temp-pred \
   --num_envs 32\
   --seed 0 \
   --n_steps 2048 \
@@ -32,3 +33,5 @@ python -m temp_interp.run.train_mlp \
   --training_steps 10000000 \
   --log_interval 1 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
+  --time_horizon 10 \
+  --gpu \

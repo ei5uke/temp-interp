@@ -17,7 +17,7 @@ curr_user=$(whoami)
 
 python -m temp_interp.run.train \
   --env_name lunar \
-  --abstraction_type temp-ensemble \
+  --abstraction_type temp-pred \
   --num_envs 32 \
   --seed 0 \
   --n_steps 2048 \
@@ -35,3 +35,4 @@ python -m temp_interp.run.train \
   --submodels \
   --sparse_submodel_type 0 \
   --num_search 5 \
+  --time_horizon 1

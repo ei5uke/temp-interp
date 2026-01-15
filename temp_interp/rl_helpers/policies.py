@@ -572,7 +572,11 @@ class MLPPolicyAC(TemporalActorCriticPolicy):
     """        
         
     def _build_action_net(self, latent_dim_pi: int) -> nn.Module:
-        return nn.Linear(latent_dim_pi, self.action_dim)
+        return nn.Sequential(
+            nn.Linear(latent_dim_pi, 128),
+            nn.Tanh(),
+            nn.Linear(128, self.action_dim)
+        )
 
     def _build_optimizer(self, lr_schedule: Schedule) -> None:
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -585,6 +589,10 @@ class MLPPolicyAC(TemporalActorCriticPolicy):
         :return: Action distribution
         """
         mean_actions = self.action_net(latent_pi)
+        if actions is not None:
+            z = th.FloatTensor(mean_actions.shape).uniform_(-0.5, 0.5).to(self.device)
+            mean_actions = mean_actions + z
+        
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> th.Tensor:
