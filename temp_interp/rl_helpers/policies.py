@@ -88,7 +88,7 @@ class TemporalActorCriticPolicy(BasePolicy):
         super().__init__(
             observation_space,
             action_space,
-            FlattenExtractor, # We force dicts to flattened np arrays
+            features_extractor_class,
             features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
@@ -101,6 +101,8 @@ class TemporalActorCriticPolicy(BasePolicy):
         new_shape = (action_space.shape[0] * time_horizon,)
         new_low = np.tile(action_space.low, time_horizon)
         new_high = np.tile(action_space.high, time_horizon)
+
+        print("Architecture:", net_arch)
 
         self.action_space = spaces.Box(low=new_low, high=new_high, shape=new_shape, dtype=action_space.dtype)
         # self.action_space = action_space
@@ -570,13 +572,21 @@ class MLPPolicyAC(TemporalActorCriticPolicy):
     """
     Actor-critic MLP policy for PPO.
     """        
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        l1_reg_coeff: float = 0.0,
+        **kwargs
+    ):
+        self.rpo_alpha = 0.5
+        self.l1_reg_coeff = l1_reg_coeff
+        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
         
     def _build_action_net(self, latent_dim_pi: int) -> nn.Module:
-        return nn.Sequential(
-            nn.Linear(latent_dim_pi, 128),
-            nn.Tanh(),
-            nn.Linear(128, self.action_dim)
-        )
+        return nn.Linear(latent_dim_pi, self.action_dim)
 
     def _build_optimizer(self, lr_schedule: Schedule) -> None:
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -589,9 +599,9 @@ class MLPPolicyAC(TemporalActorCriticPolicy):
         :return: Action distribution
         """
         mean_actions = self.action_net(latent_pi)
-        if actions is not None:
-            z = th.FloatTensor(mean_actions.shape).uniform_(-0.5, 0.5).to(self.device)
-            mean_actions = mean_actions + z
+        # if actions is not None:
+        #     z = th.FloatTensor(mean_actions.shape).uniform_(-0.5, 0.5).to(self.device)
+        #     mean_actions = mean_actions + z
         
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
 

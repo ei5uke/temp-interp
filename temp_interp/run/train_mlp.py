@@ -85,6 +85,7 @@ if __name__ == "__main__":
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
     parser.add_argument('--time_horizon', help='the time horizon of the temporal abstraction', type=int, default=10)
+    parser.add_argument('--mlp_policy_size', help='the size of the MLP policy: small, mid, max', type=str, default='mid')
 
     args = parser.parse_args()
     assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
@@ -126,8 +127,12 @@ if __name__ == "__main__":
 
     def train():
         ## wandb setup
-        run_name = f"{env_id}__{args.seed}__MLPPolicy_{args.time_horizon}_{int(time.time())}"
-        run = wandb.init(name=run_name, sync_tensorboard=True)
+        policy_map = {'small': 8, 'mid': 16, 'max': 64}
+        hidden_dim = policy_map[args.mlp_policy_size]
+        action_net_arch = [hidden_dim, hidden_dim]
+        run_name = f"{env_id}__{args.seed}__MLPPolicy_{args.time_horizon}_{'_'.join(map(str, action_net_arch))}_{int(time.time())}"
+        
+        run = wandb.init(project=args.abstraction_type + 'mlp', name=run_name, config=vars(args), sync_tensorboard=True)
         config = wandb.config
 
         log_dir = args.save_path
@@ -160,10 +165,11 @@ if __name__ == "__main__":
             'num_leaves': 0,
             'ddt_lr': config.lr,
         }
+
         policy_kwargs = {
             'features_extractor_class': features_extractor,
             'ddt_kwargs': ddt_kwargs,
-            'net_arch': {'vf': [64, 64], 'pi': [64, 64]},
+            'net_arch': {'vf': [64, 64], 'pi': action_net_arch},
             'activation_fn': th.nn.Tanh,
             'time_horizon': config.time_horizon,
             'abstraction_type': args.abstraction_type,
@@ -184,6 +190,17 @@ if __name__ == "__main__":
                     device=args.device,
                     curriculum_coef=0 if args.abstraction_type == 'temp-ensemble' else config.curriculum_coef,
                     seed=args.seed)
+
+        print(f"Policy Architecture:\n{model.policy}")
+        
+        # Calculate just the Actor (Policy) parameters
+        actor_params = sum(p.numel() for p in model.policy.mlp_extractor.policy_net.parameters()) + \
+                       sum(p.numel() for p in model.policy.action_net.parameters())
+        
+        total_params = sum(p.numel() for p in model.policy.parameters() if p.requires_grad)
+        print(f"Actor (Policy) parameters: {actor_params}")
+        print(f"Total trainable parameters: {total_params}")
+
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     

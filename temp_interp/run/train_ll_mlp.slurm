@@ -21,7 +21,7 @@ python -m temp_interp.run.train_mlp \
   --env_name lunar \
   --abstraction_type temp-pred \
   --num_envs 32\
-  --seed 0 \
+  --seed 1 \
   --n_steps 2048 \
   --lr 5e-4 \
   --batch_size 256 \
@@ -34,4 +34,5 @@ python -m temp_interp.run.train_mlp \
   --log_interval 1 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
   --time_horizon 10 \
+  --mlp_policy_size small \
   --gpu \

@@ -19,7 +19,7 @@ python -m temp_interp.run.train \
   --env_name lunar-hard \
   --abstraction_type temp-pred \
   --num_envs 32 \
-  --seed 0 \
+  --seed 1 \
   --n_steps 2048 \
   --batch_size 256 \
   --gamma 0.99 \
@@ -35,3 +35,5 @@ python -m temp_interp.run.train \
   --submodels \
   --sparse_submodel_type 0 \
   --num_search 5 \
+  --time_horizon 10 \
+  --mlp_policy_size small \

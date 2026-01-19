@@ -115,6 +115,8 @@ class PPO(OnPolicyAlgorithm):
         method: str = 'pred',
         curriculum_coef: Union[float, Schedule] = 1.0,
     ):
+        if isinstance(policy, str) and policy in self.policy_aliases:
+            policy = self.policy_aliases[policy]
         super().__init__(
             policy,
             env,
@@ -392,6 +394,17 @@ class PPO(OnPolicyAlgorithm):
                         l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
                         l1_reg_losses.append(l1_reg_loss.item())
                         policy_loss += l1_reg_loss
+                
+                # MLP L1 Regularization
+                elif isinstance(self.policy, MLPPolicyAC) and getattr(self.policy, 'l1_reg_coeff', 0) > 0:
+                    l1_loss = 0
+                    # Regularize the policy hidden layers (body)
+                    for param in self.policy.mlp_extractor.policy_net.parameters():
+                        l1_loss += th.sum(th.abs(param))
+                    # Regularize the policy output layer (head)
+                    for param in self.policy.action_net.parameters():
+                        l1_loss += th.sum(th.abs(param))
+                    policy_loss += self.policy.l1_reg_coeff * l1_loss
 
                 # Logging
                 pg_losses.append(policy_loss.item())
