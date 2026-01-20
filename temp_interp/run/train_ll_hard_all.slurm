@@ -28,7 +28,7 @@ python -m temp_interp.run.train \
   --ent-coef 0.0 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 10000000 \
+  --training_steps 3000000 \
   --log_interval 1 \
   --gpu \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll_hard/ICCTComplete_${SEED} \
@@ -36,4 +36,4 @@ python -m temp_interp.run.train \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
-  --num_search 5 \
+  --time_horizon 10 \

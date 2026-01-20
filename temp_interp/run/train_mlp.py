@@ -39,6 +39,7 @@ def make_env(env_id, gamma=None):
             env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
         else: env = gym.make(env_id)
         if gamma: env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        env = gym.wrappers.FlattenObservation(env) # change Dict to nparray
         return env
     return thunk
 
@@ -86,6 +87,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
     parser.add_argument('--time_horizon', help='the time horizon of the temporal abstraction', type=int, default=10)
     parser.add_argument('--mlp_policy_size', help='the size of the MLP policy: small, mid, max', type=str, default='mid')
+    parser.add_argument('--num_search', help='number of hyperparameter search trials', type=int, default=1)
 
     args = parser.parse_args()
     assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
@@ -104,26 +106,24 @@ if __name__ == "__main__":
         'method': 'bayes',
         'parameters': {
             'lr': {
-                'distribution': 'uniform',
-                'min': 1e-4,
-                'max': 9e-4
+                'values': [5e-4]
             },
             'clip_range': {
-                'distribution': 'uniform',
-                'min': 0.1,
-                'max': 0.3
+                'values': [0.2]
             },
             'time_horizon': {
                 'values': [args.time_horizon]
-            },
+            }
         }
     }
+
     if args.abstraction_type == 'temp-ensemble':
         sweep_config['metric'] = {'name': 'eval/mean_reward', 'goal': 'maximize'}
-        sweep_config['parameters']['decay'] = {'distribution': 'uniform', 'min': 0.5, 'max': 1.0}
+        sweep_config['parameters']['decay'] = {'values': [0.75]}
+
     elif args.abstraction_type == 'temp-pred':
         sweep_config['metric'] = {'name': 'eval/mean_total', 'goal': 'maximize'}
-        sweep_config['parameters']['curriculum_coef'] = {'distribution': 'uniform', 'min': 0.1, 'max': 1.0}
+        sweep_config['parameters']['curriculum_coef'] = {'values': [0.5]}
 
     def train():
         ## wandb setup
@@ -205,4 +205,4 @@ if __name__ == "__main__":
         run.finish()
     
     sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type + 'mlp')
-    wandb.agent(sweep_id, function=train, count=10)
+    wandb.agent(sweep_id, function=train, count=args.num_search)

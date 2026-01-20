@@ -30,7 +30,7 @@ python -m temp_interp.run.train_mlp \
   --clip-range 0.2 \
   --eval_freq 1500 \
   --min_reward 225 \
-  --training_steps 10000000 \
+  --training_steps 3000000 \
   --log_interval 1 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
   --time_horizon 10 \

@@ -34,5 +34,5 @@ python -m temp_interp.run.train \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
-  --num_search 5 \
   --time_horizon 10
+  # --num_search 5 \
