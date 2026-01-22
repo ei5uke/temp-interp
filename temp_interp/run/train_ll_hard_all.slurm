@@ -7,7 +7,7 @@
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
-#SBATCH --partition=a100-40gb
+#SBATCH --partition=v100
 #SBATCH --mem=32G
 
 module load conda
@@ -36,4 +36,4 @@ python -m temp_interp.run.train \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
-  --time_horizon 10 \
+  --time_horizon ${TIME} \

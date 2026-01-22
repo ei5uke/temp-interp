@@ -88,7 +88,7 @@ class TemporalActorCriticPolicy(BasePolicy):
         super().__init__(
             observation_space,
             action_space,
-            features_extractor_class,
+            FlattenExtractor,
             features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
@@ -136,6 +136,8 @@ class TemporalActorCriticPolicy(BasePolicy):
         self.net_arch = net_arch
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
+
+        print("Net Arch after: ", self.net_arch)
 
         self.share_features_extractor = share_features_extractor
         self.features_extractor = self.make_features_extractor()

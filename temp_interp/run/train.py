@@ -149,7 +149,7 @@ if __name__ == "__main__":
 
     def train():
         ## wandb setup
-        run_name = f"{env_id}__{args.seed}__LunarLanderICCT_{args.time_horizon}_{int(time.time())}"
+        run_name = f"{env_id}__{args.seed}__ICCT_{args.time_horizon}_{int(time.time())}"
         run = wandb.init(name=run_name, sync_tensorboard=True)
         config = wandb.config
 
@@ -239,6 +239,5 @@ if __name__ == "__main__":
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     
-    # sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type)
-    sweep_id = wandb.sweep(sweep_config, project="merge-test")
+    sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type+"ICCT")
     wandb.agent(sweep_id, function=train, count=args.num_search)
