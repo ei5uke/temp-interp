@@ -31,6 +31,6 @@ python -m temp_interp.run.train_mlp \
   --training_steps 1000000 \
   --log_interval 1 \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/lk/ \
-  --time_horizon 10 \
+  --time_horizon ${TIME} \
   --mlp_policy_size mid \
   --gpu \
