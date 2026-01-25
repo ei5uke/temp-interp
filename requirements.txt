@@ -10,4 +10,5 @@ stable-baselines3[extra]
 ipdb # optional, for debugging only.
 highway-env
 wandb
+graphviz
 # flow @ git+https://github.com/flow-project/flow.git

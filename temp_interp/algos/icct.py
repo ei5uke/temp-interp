@@ -7,6 +7,7 @@ import numpy as np
 import typing as t
 import torch.nn.functional as F
 import time
+from graphviz import Digraph
 
 class ICCT(nn.Module):
     def __init__(self,
@@ -87,6 +88,9 @@ class ICCT(nn.Module):
         self.init_paths(paths)
         self.init_leaves()
         self.sig = nn.Sigmoid()
+
+        # debug purposes
+        self.last_path = None
         
         if self.use_submodels:
             self.init_submodels(submodels) 
@@ -149,6 +153,7 @@ class ICCT(nn.Module):
                 closest_second_power = 2**np.floor(np.log2(self.num_leaves))
                 # these idcs only track the left_branch
                 end_idx = int((self.num_leaves - closest_second_power) + closest_second_power//2)
+                # end_idx = int((self.num_leaves - closest_second_power) + int(np.ceil(closest_second_power/2)))
                 left_branches[0, :end_idx] = 1
                 right_branches[0, end_idx:] = 1
                 queue = [(0, end_idx), (end_idx, self.num_leaves)]
@@ -177,6 +182,7 @@ class ICCT(nn.Module):
             leaf_index = 0
             self.leaf_init_information = []
             for level in range(2**depth):
+            # for level in range(self.num_leaves):
                 curr_node = last_level[leaf_index]
                 turn_left = going_left
                 left_path = []
@@ -465,3 +471,146 @@ class ICCT(nn.Module):
             for e, i in enumerate(self.lin_models):
                 output[e] = i(input_copy)
             return {'probs': probs, 'leaf_action': output}
+
+    def debug(self):
+        """
+        Debug the tree path taken for robustness verification
+
+        return: the tree path
+        """
+        root = self.visualize()
+        return None
+
+    def visualize(self):
+        """
+        Visualize the tree
+        """
+        # get necessary tree params
+        with torch.no_grad():
+            weights = torch.abs(self.layers)
+            # onehot_weights: [num_nodes, num_leaves]
+            onehot_weights = self.diff_argmax(weights)
+            # divisors: [num_node, 1]
+            divisors = (weights * onehot_weights).sum(-1).unsqueeze(-1)
+            # fill 0 with 1
+            divisors_filler = torch.zeros(divisors.size()).to(divisors.device)
+            divisors_filler[divisors==0] = 1
+            divisors = divisors + divisors_filler
+            new_comps = self.comparators / divisors
+            new_weights = self.layers * onehot_weights / divisors
+            new_alpha = self.alpha
+
+        # import ipdb; ipdb.set_trace()
+        # create a tree data structure to parse for visualization
+        root = Node(0)
+        root.comps = new_comps[0].item()
+        root.weight = torch.argmax(new_weights[0])
+        root.alpha = new_alpha[0]
+        # for i, leaf in enumerate(self.leaf_init_information):
+            # left = leaf[0]
+            # right = leaf[1]
+        for i in range(self.num_leaves):
+            left = torch.nonzero(self.left_path_sigs[:, i]).flatten().detach().cpu().tolist()
+            right = torch.nonzero(self.right_path_sigs[:, i]).flatten().detach().cpu().tolist()
+            full_path = sorted(left + right)
+            tmp = root
+            # for j, node_idx in enumerate(full_path):
+            for j in range(len(full_path)):
+                # tmp.is_leaf = True
+                curr_node = full_path[j]
+                if j < len(full_path) - 1: # before we create the leaf node
+                    next_node = full_path[j+1]
+                    if curr_node in left:
+                        if tmp.left_child is None:
+                            tmp.left_child = Node(next_node)
+                            tmp.left_child.comps = new_comps[next_node].item()
+                            tmp.left_child.weight = torch.argmax(new_weights[next_node])
+                            # tmp.left_child.alpha = new_alpha[next_node]
+                        tmp = tmp.left_child
+                    elif curr_node in right:
+                        if tmp.right_child is None:
+                            tmp.right_child = Node(next_node)
+                            tmp.right_child.comps = new_comps[next_node].item()
+                            tmp.right_child.weight = torch.argmax(new_weights[next_node])
+                            # tmp.right_child.alpha = new_alpha[next_node]
+                        tmp = tmp.right_child
+                else: # creating the leaf node
+                    if curr_node in left:
+                        if tmp.left_child is None:
+                            tmp.left_child = Node(-1)
+                            tmp.left_child.is_leaf = True
+                            tmp.left_child.leaf_num = i
+                            tmp.left_child.lin_model = self.lin_models[i]
+                    elif curr_node in right:
+                        if tmp.right_child is None:
+                            tmp.right_child = Node(-1)
+                            tmp.right_child.is_leaf = True
+                            tmp.right_child.leaf_num = i
+                            tmp.right_child.lin_model = self.lin_models[i]
+
+        # visualization
+        dot = Digraph(
+            comment="DDT",
+            node_attr={
+                "shape": "box",
+                "style": "rounded,filled",
+                "fillcolor": "#f8f8f8",
+                "fontname": "Helvetica"
+            },
+            edge_attr={"fontname": "Helvetica"}
+        )
+
+        def add_node(node, node_id):
+            if node is None:
+                return
+
+            # Label
+            if node.idx != -1: # comparator node
+                # label = f"Node {node.idx}: $x_{node.weight}$ ≥ {node.comps:.2f}"
+                # label = f"Node {node.idx}: <b>x</b><SUB>{node.weight}</SUB> ≥ {node.comps:.2f}"
+                label = (
+                    '<'
+                    f'<B>x</B><SUB>{node.weight}</SUB>  ≥ {node.comps:.2f}'
+                    '>'
+                )
+                dot.node(node_id, label, fillcolor="#3FADE0")
+            else: # leaf node
+                # label = f"{node.lin_model}"
+                label = f"Leaf {node.leaf_num}"
+                dot.node(node_id, label, fillcolor="#E0733F")
+
+            # Left child
+            if node.left_child:
+                left_id = f"{node_id}L"
+                dot.edge(node_id, left_id, label="True")
+                add_node(node.left_child, left_id)
+
+            # Right child
+            if node.right_child:
+                right_id = f"{node_id}R"
+                dot.edge(node_id, right_id, label="False")
+                add_node(node.right_child, right_id)
+
+        add_node(root, "0")
+
+        dot.render(
+            filename="decision_tree",
+            directory="visualization",
+            format="png",   # or "svg", "pdf"
+            cleanup=True
+        )
+
+        return root
+
+class Node:
+    def __init__(self, idx: int, is_leaf: bool=False,
+                 left_child=None, right_child=None, domain_range=None):
+        self.idx = idx
+        self.left_child = left_child
+        self.right_child = right_child
+        self.is_leaf = is_leaf
+        self.comps = None
+        self.weight = None
+        # self.alpha = None
+        self.leaf_num = None
+        self.lin_model = None
