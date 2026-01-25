@@ -2,6 +2,8 @@
 # and https://github.com/CORE-Robotics-Lab/ICCT/blob/a7887bfd824a86381599dc576b9e4c0aeac61092/icct/rl_helpers/sac.py
 # modified PPO to include action chunking training.
 
+import io
+import pathlib
 import warnings
 import copy
 from typing import Any, ClassVar, Optional, TypeVar, Union
@@ -13,11 +15,13 @@ from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, TensorDict
+from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor, check_for_correct_spaces
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.preprocessing import get_action_dim
+from stable_baselines3.common.save_util import load_from_zip_file, recursive_getattr, recursive_setattr, save_to_zip_file
+from stable_baselines3.common.vec_env.patch_gym import _convert_space
 
 from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy
 from temp_interp.rl_helpers.buffers import TemporalRolloutBuffer
@@ -182,24 +186,23 @@ class PPO(OnPolicyAlgorithm):
 
         if _init_setup_model:
             self._setup_model()
+            # project actions, states, and leaf probabilities to the same dimension (the average of the dimension spaces)
+            self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+            self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
+            self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
+            self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
+            self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+            self.policy_complexities = []
 
-        # project actions, states, and leaf probabilities to the same dimension (the average of the dimension spaces)
-        self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
-        self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
-        self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
-        self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
-        self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
-        self.policy_complexities = []
+            # only add if we are storing the flattened action to the buffer instead 
+            # of the temporal ensemble action
+            self.rollout_buffer.action_dim = self.policy.action_dim
+            self.rollout_buffer.og_action_dim = self.policy.og_action_dim
+            if self.policy.abstraction_type == 'temp-pred': self.rollout_buffer.log_prob_dim = self.policy.action_dim 
 
         # deepening / pruning variables
         self.last_morph_timestep = 0
         self.epsilon = epsilon
-
-        # only add if we are storing the flattened action to the buffer instead 
-        # of the temporal ensemble action
-        self.rollout_buffer.action_dim = self.policy.action_dim
-        self.rollout_buffer.og_action_dim = self.policy.og_action_dim
-        if self.policy.abstraction_type == 'temp-pred': self.rollout_buffer.log_prob_dim = self.policy.action_dim 
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -370,14 +373,14 @@ class PPO(OnPolicyAlgorithm):
                 losses = self._policy_loss_helper(self.policy.action_net, rollout_data, log_prob, clip_range)
                 policy_loss = losses['policy_loss']
                 ratio = losses['ratio']
-                if self.policy.abstraction_type == 'temp-pred': temp_pred_loss = losses['temp_pred_loss']
+                if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1: temp_pred_loss = losses['temp_pred_loss']
 
                 # Logging
                 pg_losses.append(policy_loss.item())
                 ratios.append(ratio.mean().item())
                 clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 clip_fractions.append(clip_fraction)
-                if self.policy.abstraction_type == 'temp-pred': 
+                if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1: 
                     pred_losses.append(temp_pred_loss.item())
 
                 # Value loss using the TD(gae_lambda) target
@@ -403,7 +406,7 @@ class PPO(OnPolicyAlgorithm):
                 entropy_losses.append(entropy_loss.item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                if self.policy.abstraction_type == 'temp-pred': loss += temp_pred_loss
+                if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1: loss += temp_pred_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -487,7 +490,8 @@ class PPO(OnPolicyAlgorithm):
         if self.policy.abstraction_type == 'temp-ensemble':
             ratio = th.exp(log_prob - rollout_data.old_log_prob)
         elif self.policy.abstraction_type == 'temp-pred':
-            old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
+            if self.policy.time_horizon > 1: old_log_prob = rollout_data.old_log_prob[:, 0, :].sum(dim=1)
+            else: old_log_prob = rollout_data.old_log_prob.reshape_as(log_prob).sum(dim=1)
             ratio = th.exp(log_prob[:, :self.policy.og_action_dim].sum(dim=1) - old_log_prob)
 
         # clipped surrogate loss
@@ -514,7 +518,7 @@ class PPO(OnPolicyAlgorithm):
         losses = {'policy_loss': policy_loss, 'ratio': ratio}
 
         # temporal loss only if abstraction is temp-pred
-        if self.policy.abstraction_type == 'temp-pred':
+        if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1:
             # temporal prediction loss 1 (log prob)
             curr_action = rollout_data.actions.clone()
             curr_action = curr_action[:, :self.policy.og_action_dim].repeat(1, self.policy.time_horizon)
@@ -619,3 +623,226 @@ class PPO(OnPolicyAlgorithm):
             reset_num_timesteps=reset_num_timesteps,
             progress_bar=progress_bar,
         )
+
+    def set_parameters(
+        self,
+        load_path_or_dict: Union[str, TensorDict],
+        exact_match: bool = True,
+        device: Union[th.device, str] = "auto",
+    ) -> None:
+        """
+        Load parameters from a given zip-file or a nested dictionary containing parameters for
+        different modules (see ``get_parameters``).
+
+        :param load_path_or_iter: Location of the saved data (path or file-like, see ``save``), or a nested
+            dictionary containing nn.Module parameters used by the policy. The dictionary maps
+            object names to a state-dictionary returned by ``torch.nn.Module.state_dict()``.
+        :param exact_match: If True, the given parameters should include parameters for each
+            module and each of their parameters, otherwise raises an Exception. If set to False, this
+            can be used to update only specific parameters.
+        :param device: Device on which the code should run.
+        """
+        params = {}
+        if isinstance(load_path_or_dict, dict):
+            params = load_path_or_dict
+        else:
+            _, params, _ = load_from_zip_file(load_path_or_dict, device=device, load_data=False)
+
+        # Keep track which objects were updated.
+        # `_get_torch_save_params` returns [params, other_pytorch_variables].
+        # We are only interested in former here.
+        objects_needing_update = set(self._get_torch_save_params()[0])
+        updated_objects = set()
+
+        for name in params:
+            attr = None
+            try:
+                attr = recursive_getattr(self, name)
+            except Exception as e:
+                # What errors recursive_getattr could throw? KeyError, but
+                # possible something else too (e.g. if key is an int?).
+                # Catch anything for now.
+                raise ValueError(f"Key {name} is an invalid object name.") from e
+
+            if isinstance(attr, th.optim.Optimizer):
+                # # Optimizers do not support "strict" keyword...
+                # # Seems like they will just replace the whole
+                # # optimizer state with the given one.
+                # # On top of this, optimizer state-dict
+                # # seems to change (e.g. first ``optim.step()``),
+                # # which makes comparing state dictionary keys
+                # # invalid (there is also a nesting of dictionaries
+                # # with lists with dictionaries with ...), adding to the
+                # # mess.
+                # #
+                # # TL;DR: We might not be able to reliably say
+                # # if given state-dict is missing keys.
+                # #
+                # # Solution: Just load the state-dict as is, and trust
+                # # the user has provided a sensible state dictionary.
+                # attr.load_state_dict(params[name])  # type: ignore[arg-type]
+                pass
+            else:
+                # Assume attr is th.nn.Module
+                attr.load_state_dict(params[name], strict=exact_match)
+                updated_objects.add(name)
+    
+    @classmethod
+    def load(  # noqa: C901
+        cls: type[SelfPPO],
+        path: str,
+        env: GymEnv,
+        device: str = "auto",
+        custom_objects = None,
+        print_system_info: bool = False,
+        force_reset: bool = True,
+        **kwargs,
+    ) -> SelfPPO:
+        """
+        Load the model from a zip-file.
+        Warning: ``load`` re-creates the model from scratch, it does not update it in-place!
+        For an in-place load use ``set_parameters`` instead.
+
+        :param path: path to the file (or a file-like) where to
+            load the agent from
+        :param env: the new environment to run the loaded model on
+            (can be None if you only need prediction from a trained model) has priority over any saved environment
+        :param device: Device on which the code should run.
+        :param custom_objects: Dictionary of objects to replace
+            upon loading. If a variable is present in this dictionary as a
+            key, it will not be deserialized and the corresponding item
+            will be used instead. Similar to custom_objects in
+            ``keras.models.load_model``. Useful when you have an object in
+            file that can not be deserialized.
+        :param print_system_info: Whether to print system info from the saved model
+            and the current system info (useful to debug loading issues)
+        :param force_reset: Force call to ``reset()`` before training
+            to avoid unexpected behavior.
+            See https://github.com/DLR-RM/stable-baselines3/issues/597
+        :param kwargs: extra arguments to change the model when loading
+        :return: new model instance with loaded parameters
+        """
+        data, params, pytorch_variables = load_from_zip_file(
+            path,
+            device=device,
+            custom_objects=custom_objects,
+            print_system_info=print_system_info,
+        )
+
+        assert data is not None, "No data found in the saved file"
+        assert params is not None, "No params found in the saved file"
+
+        # Remove stored device information and replace with ours
+        if "policy_kwargs" in data:
+            data["policy_kwargs"]["ddt_kwargs"]["num_leaves"] = 3 # this should be whatever the final number of leaves is
+            if "device" in data["policy_kwargs"]:
+                del data["policy_kwargs"]["device"]
+            # backward compatibility, convert to new format
+            saved_net_arch = data["policy_kwargs"].get("net_arch")
+            if saved_net_arch and isinstance(saved_net_arch, list) and isinstance(saved_net_arch[0], dict):
+                data["policy_kwargs"]["net_arch"] = saved_net_arch[0]
+
+        if "policy_kwargs" in kwargs and kwargs["policy_kwargs"] != data["policy_kwargs"]:
+            raise ValueError(
+                f"The specified policy kwargs do not equal the stored policy kwargs."
+                f"Stored kwargs: {data['policy_kwargs']}, specified kwargs: {kwargs['policy_kwargs']}"
+            )
+
+        if "observation_space" not in data or "action_space" not in data:
+            raise KeyError("The observation_space and action_space were not given, can't verify new environments")
+
+        # Gym -> Gymnasium space conversion
+        for key in {"observation_space", "action_space"}:
+            data[key] = _convert_space(data[key])
+
+        if env is not None:
+            # Wrap first if needed
+            env = cls._wrap_env(env, data["verbose"])
+            # Check if given env is valid
+            check_for_correct_spaces(env, data["observation_space"], data["action_space"])
+            # Discard `_last_obs`, this will force the env to reset before training
+            # See issue https://github.com/DLR-RM/stable-baselines3/issues/597
+            if force_reset and data is not None:
+                data["_last_obs"] = None
+            # `n_envs` must be updated. See issue https://github.com/DLR-RM/stable-baselines3/issues/1018
+            if data is not None:
+                data["n_envs"] = env.num_envs
+        else:
+            # Use stored env, if one exists. If not, continue as is (can be used for predict)
+            if "env" in data:
+                env = data["env"]
+
+        model = cls(
+            policy=data["policy_class"],
+            env=env,
+            # policy_kwargs=data["policy_kwargs"],
+            device=device,
+            _init_setup_model=False,  # type: ignore[call-arg]
+        )
+
+        # load parameters
+        model.__dict__.update(data)
+        model.__dict__.update(kwargs)
+        model._setup_model()
+
+        try:
+            # put state_dicts back in place
+            model.set_parameters(params, exact_match=True, device=device)
+        except RuntimeError as e:
+            # Patch to load policies saved using SB3 < 1.7.0
+            # the error is probably due to old policy being loaded
+            # See https://github.com/DLR-RM/stable-baselines3/issues/1233
+            if "pi_features_extractor" in str(e) and "Missing key(s) in state_dict" in str(e):
+                model.set_parameters(params, exact_match=False, device=device)
+                warnings.warn(
+                    "You are probably loading a A2C/PPO model saved with SB3 < 1.7.0, "
+                    "we deactivated exact_match so you can save the model "
+                    "again to avoid issues in the future "
+                    "(see https://github.com/DLR-RM/stable-baselines3/issues/1233 for more info). "
+                    f"Original error: {e} \n"
+                    "Note: the model should still work fine, this only a warning."
+                )
+            else:
+                raise e
+        except ValueError as e:
+            # Patch to load DQN policies saved using SB3 < 2.4.0
+            # The target network params are no longer in the optimizer
+            # See https://github.com/DLR-RM/stable-baselines3/pull/1963
+            saved_optim_params = params["policy.optimizer"]["param_groups"][0]["params"]  # type: ignore[index]
+            n_params_saved = len(saved_optim_params)
+            n_params = len(model.policy.optimizer.param_groups[0]["params"])
+            if n_params_saved == 2 * n_params:
+                # Truncate to include only online network params
+                params["policy.optimizer"]["param_groups"][0]["params"] = saved_optim_params[:n_params]  # type: ignore[index]
+
+                model.set_parameters(params, exact_match=True, device=device)
+                warnings.warn(
+                    "You are probably loading a DQN model saved with SB3 < 2.4.0, "
+                    "we truncated the optimizer state so you can save the model "
+                    "again to avoid issues in the future "
+                    "(see https://github.com/DLR-RM/stable-baselines3/pull/1963 for more info). "
+                    f"Original error: {e} \n"
+                    "Note: the model should still work fine, this only a warning."
+                )
+            else:
+                raise e
+
+        # put other pytorch variables back in place
+        if pytorch_variables is not None:
+            for name in pytorch_variables:
+                # Skip if PyTorch variable was not defined (to ensure backward compatibility).
+                # This happens when using SAC/TQC.
+                # SAC has an entropy coefficient which can be fixed or optimized.
+                # If it is optimized, an additional PyTorch variable `log_ent_coef` is defined,
+                # otherwise it is initialized to `None`.
+                if pytorch_variables[name] is None:
+                    continue
+                # Set the data attribute directly to avoid issue when using optimizers
+                # See https://github.com/DLR-RM/stable-baselines3/issues/391
+                recursive_setattr(model, f"{name}.data", pytorch_variables[name].data)
+
+        # Sample gSDE exploration matrix, so it uses the right device
+        # see issue #44
+        if model.use_sde:
+            model.policy.reset_noise()  # type: ignore[operator]
+        return model
