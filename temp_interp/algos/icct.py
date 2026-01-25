@@ -355,6 +355,9 @@ class ICCT(nn.Module):
         left_path_probs = left_path_probs.permute(0, 2, 1)
         right_path_probs = right_path_probs.permute(0, 2, 1)
 
+        with torch.no_grad():
+            self.last_path = [left_path_probs, right_path_probs]
+
         # We don't want 0s to ruin leaf probabilities, so replace them with 1s so they don't affect the product
         left_filler = torch.zeros(self.left_path_sigs.size()).to(left_path_probs.device)
         left_filler[self.left_path_sigs == 0] = 1
@@ -478,10 +481,10 @@ class ICCT(nn.Module):
 
         return: the tree path
         """
-        root = self.visualize()
+        root = self.visualize(self.last_path)
         return None
 
-    def visualize(self):
+    def visualize(self, name="decision_tree", path=None):
         """
         Visualize the tree
         """
@@ -500,23 +503,25 @@ class ICCT(nn.Module):
             new_weights = self.layers * onehot_weights / divisors
             new_alpha = self.alpha
 
-        # import ipdb; ipdb.set_trace()
         # create a tree data structure to parse for visualization
         root = Node(0)
         root.comps = new_comps[0].item()
         root.weight = torch.argmax(new_weights[0])
         root.alpha = new_alpha[0]
-        # for i, leaf in enumerate(self.leaf_init_information):
-            # left = leaf[0]
-            # right = leaf[1]
+        if path: root.highlight = True
+
         for i in range(self.num_leaves):
             left = torch.nonzero(self.left_path_sigs[:, i]).flatten().detach().cpu().tolist()
             right = torch.nonzero(self.right_path_sigs[:, i]).flatten().detach().cpu().tolist()
             full_path = sorted(left + right)
+
+            if path: # debugging purposes
+                debug_left = torch.nonzero(path[0][0][:, i]).flatten().detach().cpu().tolist()
+                debug_right = torch.nonzero(path[1][0][:, i]).flatten().detach().cpu().tolist()
+                debug_path = sorted(left + right)[1:]
+
             tmp = root
-            # for j, node_idx in enumerate(full_path):
             for j in range(len(full_path)):
-                # tmp.is_leaf = True
                 curr_node = full_path[j]
                 if j < len(full_path) - 1: # before we create the leaf node
                     next_node = full_path[j+1]
@@ -525,6 +530,8 @@ class ICCT(nn.Module):
                             tmp.left_child = Node(next_node)
                             tmp.left_child.comps = new_comps[next_node].item()
                             tmp.left_child.weight = torch.argmax(new_weights[next_node])
+                            if path and len(debug_path) == self.num_leaves - 2 and next_node in debug_path:
+                                tmp.left_child.highlight = True
                             # tmp.left_child.alpha = new_alpha[next_node]
                         tmp = tmp.left_child
                     elif curr_node in right:
@@ -532,21 +539,25 @@ class ICCT(nn.Module):
                             tmp.right_child = Node(next_node)
                             tmp.right_child.comps = new_comps[next_node].item()
                             tmp.right_child.weight = torch.argmax(new_weights[next_node])
+                            if path and len(debug_path) == self.num_leaves - 2 and next_node in debug_path:
+                                tmp.right_child.highlight = True
                             # tmp.right_child.alpha = new_alpha[next_node]
                         tmp = tmp.right_child
                 else: # creating the leaf node
                     if curr_node in left:
-                        if tmp.left_child is None:
-                            tmp.left_child = Node(-1)
-                            tmp.left_child.is_leaf = True
-                            tmp.left_child.leaf_num = i
-                            tmp.left_child.lin_model = self.lin_models[i]
+                        tmp.left_child = Node(-1)
+                        tmp.left_child.is_leaf = True
+                        tmp.left_child.leaf_num = i
+                        tmp.left_child.lin_model = self.lin_models[i]
+                        if path and len(debug_path) == self.num_leaves - 2 and curr_node in debug_path:
+                            tmp.left_child.highlight = True
                     elif curr_node in right:
-                        if tmp.right_child is None:
-                            tmp.right_child = Node(-1)
-                            tmp.right_child.is_leaf = True
-                            tmp.right_child.leaf_num = i
-                            tmp.right_child.lin_model = self.lin_models[i]
+                        tmp.right_child = Node(-1)
+                        tmp.right_child.is_leaf = True
+                        tmp.right_child.leaf_num = i
+                        tmp.right_child.lin_model = self.lin_models[i]
+                        if path and len(debug_path) == self.num_leaves - 2 and curr_node in debug_path:
+                            tmp.left_child.highlight = True
 
         # visualization
         dot = Digraph(
@@ -566,40 +577,49 @@ class ICCT(nn.Module):
 
             # Label
             if node.idx != -1: # comparator node
-                # label = f"Node {node.idx}: $x_{node.weight}$ ≥ {node.comps:.2f}"
-                # label = f"Node {node.idx}: <b>x</b><SUB>{node.weight}</SUB> ≥ {node.comps:.2f}"
                 label = (
                     '<'
                     f'<B>x</B><SUB>{node.weight}</SUB>  ≥ {node.comps:.2f}'
                     '>'
                 )
-                dot.node(node_id, label, fillcolor="#3FADE0")
+                if not node.highlight:
+                    dot.node(node_id, label, fillcolor="#C8C8C6")
+                else:
+                    dot.node(node_id, label, fillcolor="#FA4F3D")
             else: # leaf node
                 # label = f"{node.lin_model}"
                 label = f"Leaf {node.leaf_num}"
-                dot.node(node_id, label, fillcolor="#E0733F")
+                if not node.highlight:
+                    dot.node(node_id, label, fillcolor="#C8C8C6")
+                else:
+                    dot.node(node_id, label, fillcolor="#FA4F3D")
 
             # Left child
             if node.left_child:
                 left_id = f"{node_id}L"
-                dot.edge(node_id, left_id, label="True")
+                if not node.left_child.highlight:
+                    dot.edge(node_id, left_id, label="True")
+                else: 
+                    dot.edge(node_id, left_id, label="True", color="#FA4F3D")
                 add_node(node.left_child, left_id)
 
             # Right child
             if node.right_child:
                 right_id = f"{node_id}R"
-                dot.edge(node_id, right_id, label="False")
+                if not node.right_child.highlight:
+                    dot.edge(node_id, right_id, label="False")
+                else:
+                    dot.edge(node_id, right_id, label="False", color="#FA4F3D")
                 add_node(node.right_child, right_id)
 
         add_node(root, "0")
 
         dot.render(
-            filename="decision_tree",
+            filename=name,
             directory="visualization",
-            format="png",   # or "svg", "pdf"
+            format="pdf",   # or "svg", "png"
             cleanup=True
         )
-
         return root
 
 class Node:
@@ -614,3 +634,4 @@ class Node:
         # self.alpha = None
         self.leaf_num = None
         self.lin_model = None
+        self.highlight = None
