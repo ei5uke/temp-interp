@@ -513,7 +513,7 @@ class LunarLanderHard(gym.Env, EzPickle):
 
         if self.continuous:
             # add noise
-            action = action.astype(np.float64) + np.random.randn(*action.shape) * 0.005
+            action = action.astype(np.float64) + self.np_random.standard_normal(*action.shape) * 0.005
             action = np.clip(action, -1, +1)
         else:
             assert self.action_space.contains(
