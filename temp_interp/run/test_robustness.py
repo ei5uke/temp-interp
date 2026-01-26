@@ -28,10 +28,9 @@ from temp_interp.rl_helpers.ppo import PPO
 from temp_interp.algos.icct_helpers import convert_to_crisp
 import temp_interp.envs.lunar_lander_hard
 
-def make_env(env_id, gamma=None):
+def make_env(env_id):
     def thunk():
         env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
-        if gamma: env = gym.wrappers.NormalizeReward(env, gamma=gamma)
         env = gym.wrappers.FlattenObservation(env) # change Dict to nparray
         return env
     return thunk
@@ -70,15 +69,13 @@ if __name__ == "__main__":
     
     set_random_seed(args.seed)
     env_id = 'LunarLanderHard'
-    env = make_env(env_id, gamma=args.gamma)()
-    closed_model_env = make_env(env_id, gamma=args.gamma)()
+    env = make_env(env_id)()
 
-    if args.gpu:
-        args.device = 'cuda'
-    else:
-        args.device = 'cpu'
-        
     # debug
+    # if args.gpu:
+    #     args.device = 'cuda'
+    # else:
+    #     args.device = 'cpu'
     # features_extractor = FlattenExtractor
     # args.fs_submodel_version = 0
     # ddt_kwargs = {
@@ -124,40 +121,96 @@ if __name__ == "__main__":
 
     # load model
     model = PPO.load(args.load_path + "/" + args.load_file, env=env)
+    # model.policy.action_net.debug()
 
-    model.policy.action_net.debug()
-
-    # deployment loop
-    obs = env.reset(seed=args.seed)[0]
-    _ = closed_model_env.reset(seed=args.seed)[0] # has slight random shift
-    render = False
-    false_positives = 0 # the current method doesn't ccoutn for positive-falses and false-falses
-    positive_positives = 0
+    # deployment loop to check for confusion matrix
+    true_positives = false_positives = false_negatives = true_negatives = 0
+    A = B = 0
+    no_guess = 0
+    late_guess = 0
+    done_timestep = []
+    all_rewards = []
     for i in range(args.num_episodes):
+        seed = args.seed + i
         done = False
-        pred_crash = None
-        while not done:
+        pred_finish = None
+        pred_reward = None
+        seen_obs = []
+        taken_actions = []
+        episode_reward = 0
+        step = 0
+        while not done or step < 1000:
+            step += 1
+            env = make_env(env_id)()
+            obs = env.reset(seed=seed)[0]
+            if len(seen_obs) == 0: seen_obs.append(obs)
+
+            for j, taken_action in enumerate(taken_actions):
+                obs, reward, done, trunc, _ = env.step(taken_action)
+
             action, _ = model.predict(obs, deterministic=True)
             next_action = action[:2]
+            taken_actions.append(next_action)
             pred_actions = action[2:]
-            obs, reward, done, _, _ = env.step(next_action)
-            if not pred_crash:
-                closed_model_env.step(next_action)
-                for j in range(len(pred_actions) // 2):
-                    _, _, c_done, _, _ = closed_model_env.step(pred_actions[2*j:2*j+1])
-                    if c_done:
-                        pred_crash = j+1
-            elif pred_crash > 0:
-                pred_crash -= 1
-            else:
-                if done: positive_positives += 1
-                else: false_positives += 1
 
-            if render:
-                env.render()
-            if done:
-                obs = env.reset(seed=args.seed+i)[0]
-                _ = closed_model_env.reset(seed=args.seed+i)[0] # has slight random shift
+            obs, reward, done, trunc, _ = env.step(next_action)
+            episode_reward += reward
+            seen_obs.append(obs)
+
+            if pred_finish is None:
+                for k in range(len(pred_actions) // 2):
+                    pred_obs, pred_reward, pred_done, pred_trunc, _ = env.step(pred_actions[2*k:2*k+2])
+                    if pred_done:
+                        done_timestep.append(k)
+                        pred_finish = k
+                        break
+            elif pred_finish > 0:
+                pred_finish -= 1
+                if done: 
+                    late_guess += 1
+                    env.close()
+                    all_rewards.append(episode_reward.item())
+                    break
+            elif pred_finish == 0:
+                if done:
+                    A += 1
+                    if pred_reward == reward:
+                        if pred_reward == 100:
+                            true_positives += 1
+                        elif pred_reward == -100:
+                            true_negatives += 1
+                    else:
+                        if pred_reward == -100:
+                            false_negatives += 1
+                        elif pred_reward == 100:
+                            false_positives += 1
+                else:
+                    B += 1
+                    if pred_reward == 100: false_positives += 1
+                    elif pred_reward == -100: false_negatives += 1
+                all_rewards.append(episode_reward.item())
+                env.close()
                 break
+
+            env.close()
+
+            if done and pred_finish is None:
+                no_guess += 1
+                all_rewards.append(episode_reward.item())
+                break
+            elif done and pred_finish==0:
+                late_guess += 1
+                env.close()
+                all_rewards.append(episode_reward.item())
+                break
+            elif done:
+                import ipdb; ipdb.set_trace()
+
+    print(f"TP: {true_positives}")
     print(f"FP: {false_positives}")
-    print(f"PP: {positive_positives}")
+    print(f"FN: {false_negatives}")
+    print(f"TN: {true_negatives}")
+    print(f"NG: {no_guess}")
+    print(f"LG: {late_guess}")
+    print(f"Avg/S.e. timestep: {np.mean(done_timestep)}, {np.std(done_timestep) / len(done_timestep)}")
+    print(np.mean(all_rewards), np.std(all_rewards) / len(all_rewards))
