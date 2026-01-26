@@ -198,6 +198,7 @@ class PPO(OnPolicyAlgorithm):
         # of the temporal ensemble action
         self.rollout_buffer.action_dim = self.policy.action_dim
         self.rollout_buffer.og_action_dim = self.policy.og_action_dim
+        self.rollout_buffer.abstraction_type = self.policy.abstraction_type
         if self.policy.abstraction_type == 'temp-pred': self.rollout_buffer.log_prob_dim = self.policy.action_dim 
 
     def _setup_model(self) -> None:
