@@ -481,7 +481,7 @@ class ICCT(nn.Module):
 
         return: the tree path
         """
-        root = self.visualize(self.last_path)
+        root = self.visualize(name="debugging_path", path=self.last_path)
         return None
 
     def visualize(self, name="decision_tree", path=None):
