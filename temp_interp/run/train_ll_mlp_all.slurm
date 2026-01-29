@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=1
 echo "Running MLP with Action Chunking with seed ${SEED} and method ${METHOD}"
 curr_user=$(whoami)
 
-python -m temp_interp.run.train \
+python -m temp_interp.run.train_mlp \
   --env_name lunar \
   --abstraction_type ${METHOD} \
   --num_envs 32 \
