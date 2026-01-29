@@ -349,7 +349,8 @@ class PPO(OnPolicyAlgorithm):
         clip_fractions = []
 
         # deepen / prune the tree
-        method = self._check_morph()
+        morph_batch = next(self.rollout_buffer.get(self.env.num_envs * self.n_steps))
+        method = self._check_morph(morph_batch.returns)
         if method is not None:
             self._morph(method)
 
@@ -406,7 +407,9 @@ class PPO(OnPolicyAlgorithm):
                 entropy_losses.append(entropy_loss.item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1: loss += temp_pred_loss
+                if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1: 
+                    scale = 0.005 # for LL-H; 1 for everything else
+                    loss += scale * temp_pred_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -546,8 +549,10 @@ class PPO(OnPolicyAlgorithm):
         loss = (loss_A_B + loss_B_A) / 2
         return np.log(self.batch_size) - loss.cpu().item()
 
-    def _check_morph(self, min_headstart=10000, min_timesteps=1000, min_evaluations=4):
-    # def _check_morph(self, min_headstart=1000, min_timesteps=500, min_evaluations=1): # debugging
+    def _check_morph(self, returns, min_headstart=10000, min_timesteps=1000, min_evaluations=4): # ll, ll-h
+    # def _check_morph(self, returns, min_headstart=6000, min_timesteps=600, min_evaluations=3): # ip
+    # def _check_morph(self, returns, min_headstart=2000, min_timesteps=200, min_evaluations=2): # lk
+    # def _check_morph(self, returns, min_headstart=1000, min_timesteps=500, min_evaluations=1): # debugging
         """
         Check whether we should morph (deepen or prune) the tree. Return whether to deepen or prune if enough timesteps 
         have passed and if the policy complexities have, on-average, been increasing / decreasing by more than epsilon.
@@ -560,14 +565,24 @@ class PPO(OnPolicyAlgorithm):
         print(f"visitations: {self.policy.action_net.visitations}", flush=True)
         if self.num_timesteps > min_headstart and (self.num_timesteps - min_timesteps) > self.last_morph_timestep and len(self.policy_complexities) > min_evaluations:
             trend = np.mean(np.gradient(self.policy_complexities))
-            print(f"trend: {trend}", flush=True)
-            if trend - self.epsilon > 0:
-                self.policy_complexities = []
-                return 'deepen'
-            # elif trend + self.epsilon < 0 and self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) == 0:
-            elif self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) == 0: # prune anytime we have unvisited leaves and we don't deepen.
+            print(f"trend: {trend}, returns: {returns.mean().item()}", flush=True)
+
+            # if IP, LL, or LK:
+            # if trend < self.epsilon and returns.mean().item() < 0: # IP, LL
+            # if trend < self.epsilon and returns.mean().item() < -0.3: # LK
+            #     self.policy_complexities = []
+            #     return 'deepen'
+            # elif self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) <= 1e5:
+            #     self.policy_complexities = []
+            #     return 'prune'
+
+            # if LL-H:
+            if self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) <= 1e5:
                 self.policy_complexities = []
                 return 'prune'
+            elif trend < self.epsilon and (returns > 0).sum().item() < returns.shape[0] // 2:
+                self.policy_complexities = []
+                return 'deepen'
 
             # # debugging
             # self.policy_complexities = []
