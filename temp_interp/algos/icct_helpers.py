@@ -1,4 +1,5 @@
 # reference: https://github.com/CORE-Robotics-Lab/ICCT/blob/main/icct/core/icct_helpers.py
+# and: https://github.com/CORE-Robotics-Lab/Team-Development-with-Transparent-Policies/blob/4ed586005ddfefa6634f216e700cbefeda804ab0/ipm/models/idct_helpers.py#L267
 
 import numpy as np
 import sys
@@ -6,147 +7,6 @@ from temp_interp.algos.icct import ICCT
 import torch
 import copy
 from collections import defaultdict
-
-# TODO: unused
-# def convert_to_crisp(fuzzy_model, training_data):
-#     new_weights = []
-#     new_comps = []
-#     device = fuzzy_model.device
-
-#     weights = np.abs(fuzzy_model.layers.cpu().detach().numpy())
-#     most_used = np.argmax(weights, axis=1)
-#     for comp_ind, comparator in enumerate(fuzzy_model.comparators):
-#         comparator = comparator.item()
-#         divisor = abs(fuzzy_model.layers[comp_ind][most_used[comp_ind]].item())
-#         if divisor == 0:
-#             divisor = 1
-#         comparator /= divisor
-#         new_comps.append([comparator])
-#         max_ind = most_used[comp_ind]
-#         new_weight = np.zeros(len(fuzzy_model.layers[comp_ind].data))
-#         new_weight[max_ind] = fuzzy_model.layers[comp_ind][most_used[comp_ind]].item() / divisor
-#         new_weights.append(new_weight)
-
-#     new_input_dim = fuzzy_model.input_dim
-#     new_weights = np.array(new_weights)
-#     new_comps = np.array(new_comps)
-#     new_alpha = fuzzy_model.alpha
-#     new_alpha = 9999999. * new_alpha.cpu().detach().numpy() / np.abs(new_alpha.cpu().detach().numpy())
-#     crispy_model = ICCT(input_dim=new_input_dim,
-#                         output_dim=fuzzy_model.output_dim,
-#                         weights=new_weights,
-#                         comparators=new_comps,
-#                         leaves=fuzzy_model.leaf_init_information,
-#                         alpha=new_alpha,
-#                         use_individual_alpha=fuzzy_model.use_individual_alpha,
-#                         use_submodels=fuzzy_model.use_submodels,
-#                         hard_node=False,
-#                         sparse_submodel_type=fuzzy_model.sparse_submodel_type,
-#                         l1_hard_attn=False,
-#                         num_sub_features=fuzzy_model.num_sub_features,
-#                         use_gumbel_softmax=fuzzy_model.use_gumbel_softmax,
-#                         device=device).to(device)
-#     if hasattr(fuzzy_model, 'action_mus'):
-#         crispy_model.action_mus.data = fuzzy_model.action_mus.data
-#     crispy_model.action_stds.data = fuzzy_model.action_stds.data
-#     if fuzzy_model.use_submodels:
-#         if fuzzy_model.sparse_submodel_type != 2:
-#             crispy_model.lin_models = fuzzy_model.lin_models
-#         else:
-#             crispy_model.sub_scalars = fuzzy_model.sub_scalars
-#             crispy_model.sub_weights = fuzzy_model.sub_weights
-#             crispy_model.sub_biases = fuzzy_model.sub_biases
-
-#     return crispy_model
-
-# Below code was modified from https://github.com/CORE-Robotics-Lab/Team-Development-with-Transparent-Policies/blob/4ed586005ddfefa6634f216e700cbefeda804ab0/ipm/models/idct_helpers.py#L267
-
-class Node:
-    def __init__(self, idx: int, node_depth: int, is_leaf: bool=False,
-                 left_child=None, right_child=None, domain_range=None):
-        self.idx = idx
-        self.node_depth = node_depth
-        self.left_child = left_child
-        self.right_child = right_child
-        self.is_leaf = is_leaf
-        self.domain_range = domain_range
-
-def find_ancestors(root, node_idx):
-    q = [(root, [], [])]
-    while q:
-        node, curr_left_ancestors, curr_right_ancestors = q.pop(0)
-        if node.idx == node_idx:
-            return node, curr_left_ancestors, curr_right_ancestors
-        if node.left_child and not node.left_child.is_leaf:
-            q.append((node.left_child, curr_left_ancestors + [node], curr_right_ancestors))
-        if node.right_child and not node.right_child.is_leaf:
-            q.append((node.right_child, curr_left_ancestors, curr_right_ancestors + [node]))
-    raise ValueError(f'Node with idx {node_idx} not found in tree')
-
-def find_root(leaves):
-    root_node = 0
-    nodes_in_leaf_path = []
-    for leaf in leaves:
-        combined_ancestors = leaf[1][0] + leaf[1][1] # these are both lists, concat operation
-        nodes_in_leaf_path.append(combined_ancestors)
-    for node in nodes_in_leaf_path[0]:
-        found_root = True
-        for nodes in nodes_in_leaf_path:
-            if node not in nodes:
-                found_root = False
-        if found_root:
-            root_node = node
-            break
-    return root_node
-
-def find_children(node, leaves, current_depth):
-    # dfs
-    left_subtree = [leaf for leaf in leaves if node.idx in leaf[1][0]]
-    right_subtree = [leaf for leaf in leaves if node.idx in leaf[1][1]]
-
-    for _, leaf in left_subtree:
-        leaf[0].remove(node.idx)
-
-    for _, leaf in right_subtree:
-        leaf[1].remove(node.idx)
-
-    left_child_is_leaf = len(left_subtree) == 1
-    right_child_is_leaf = len(right_subtree) == 1
-
-    if not left_child_is_leaf:
-        left_child = find_root(left_subtree)
-    else:
-        left_child = left_subtree[0][0]
-    if not right_child_is_leaf:
-        right_child = find_root(right_subtree)
-    else:
-        right_child = right_subtree[0][0]
-
-    left_child = Node(left_child, current_depth, left_child_is_leaf)
-    right_child = Node(right_child, current_depth, right_child_is_leaf)
-    node.left_child = left_child
-    node.right_child = right_child
-
-    if not left_child_is_leaf:
-        find_children(left_child, left_subtree, current_depth + 1)
-    if not right_child_is_leaf:
-        find_children(right_child, right_subtree, current_depth + 1)
-
-def compute_entropy(input: []):
-    """
-    Computes the entropy of a list of probabilities
-    :param input: list of probabilities
-    :return: entropy
-    """
-    return -np.sum([p * np.log(p) for p in input])
-
-def logits_to_probs(logits): # TODO: this seems to be for discrete actions -> yes it's for overcooked
-    """
-    Converts logits to probabilities
-    :param logits: list of logits
-    :return: list of probabilities
-    """
-    return [np.exp(logit) / np.sum(np.exp(logits)) for logit in logits]
 
 def deepen_icct(tree, rollout_data, device='cpu'):
     """
@@ -164,7 +24,7 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     leaf_action = dictionary['leaf_action'].transpose(0, 1)
     action_diff = rollout_data.actions.unsqueeze(1).expand(-1, tree.num_leaves, -1) - leaf_action
     scaled_action_diff = action_diff * rollout_data.advantages.unsqueeze(1).expand(-1, tree.num_leaves).unsqueeze(-1)
-    action_variance = scaled_action_diff.std(dim=-1)
+    action_variance = 1 / scaled_action_diff.std(dim=-1)
     score = (probs * action_variance).mean(dim=0)
     deepened_leaf = torch.argmax(score).item()
     # Method 2: find leaf w/ max visitations
@@ -218,18 +78,8 @@ def deepen_icct(tree, rollout_data, device='cpu'):
     new_leaf_information = old_leaf_info
     new_leaf_information.append([new_leaf1_left, new_leaf1_right])
     new_leaf_information.append([new_leaf2_left, new_leaf2_right])
-    # if len(set(new_leaf1_left) & set(new_leaf1_right)) > 0: import ipdb; ipdb.set_trace()
-    # if len(set(new_leaf2_left) & set(new_leaf2_right)) > 0: import ipdb; ipdb.set_trace()
     # Remove the old leaf
     del new_leaf_information[deepened_leaf]
-
-    # if len(new_leaf_information) != len(tree.lin_models) + 1:
-    #     import ipdb; ipdb.set_trace()
-    # for leaf in new_leaf_information:
-    #     left = set(leaf[0])
-    #     right = set(leaf[1])
-    #     if len(left & right) > 0:
-    #         import ipdb; ipdb.set_trace()
 
     new_network = ICCT(input_dim=tree.input_dim, 
                     output_dim=tree.output_dim, 
@@ -237,7 +87,7 @@ def deepen_icct(tree, rollout_data, device='cpu'):
                     comparators=new_comps,
                     leaves=new_leaf_information, 
                     alpha=new_alphas, 
-                    paths=None, # may not need
+                    paths=None,
                     submodels=new_submodels,
                     use_individual_alpha=tree.use_individual_alpha, 
                     device=device,
@@ -259,12 +109,6 @@ def prune_icct(tree, device='cpu'):
     :param tree: the tree
     :param device: device used for pytorch
     """
-    # for leaf in tree.leaf_init_information:
-    #     left = set(leaf[0])
-    #     right = set(leaf[1])
-    #     if len(left & right) > 0:
-    #         import ipdb; ipdb.set_trace()
-
     leaf_info = copy.deepcopy(tree.leaf_init_information)
 
     # get the leaf/node to prune
@@ -282,8 +126,6 @@ def prune_icct(tree, device='cpu'):
     for leaf_idx, leaf in enumerate(leaf_info):
         left = set(leaf[0])
         right = set(leaf[1])
-        # if len(left & right) > 0:
-        #     import ipdb; ipdb.set_trace()
 
         if decision_node_index != max(left | right):
             new_leaf_info_pruned.append(leaf)
@@ -309,10 +151,6 @@ def prune_icct(tree, device='cpu'):
     # new leaf info with adjusted ancestors
     new_leaf_info_adjusted_ancestors = []
     for leaf in new_leaf_info_pruned:
-        # left = set(leaf[0])
-        # right = set(leaf[1])
-        # if len(left & right) > 0:
-        #     import ipdb; ipdb.set_trace()
 
         # populate left ancestors
         # we want to remove the decision node from the ancestors
@@ -337,15 +175,6 @@ def prune_icct(tree, device='cpu'):
             right_ancestors.append(adjusted_node_idx)
 
         new_leaf_info_adjusted_ancestors.append([left_ancestors, right_ancestors])
-
-    # if len(new_leaf_info_adjusted_ancestors) != len(tree.lin_models) - 1:
-    #     import ipdb; ipdb.set_trace()
-
-    # for leaf in new_leaf_info_adjusted_ancestors:
-    #     left = set(leaf[0])
-    #     right = set(leaf[1])
-    #     if len(left & right) > 0:
-    #         import ipdb; ipdb.set_trace()
 
     # we need to filter out the decision nodes that we are pruning
     # from the prior weights, comparators, and alphas
@@ -380,7 +209,7 @@ def prune_icct(tree, device='cpu'):
                     comparators=new_comps,
                     leaves=new_leaf_info_adjusted_ancestors, 
                     alpha=new_alpha, 
-                    paths=None, # may not need
+                    paths=None,
                     submodels=new_submodels,
                     use_individual_alpha=tree.use_individual_alpha, 
                     device=device,
