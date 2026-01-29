@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=DDT-AC
-#SBATCH --output=temp_interp/run/logs/ip/complete_lr-3e-4_seed-0.log
+#SBATCH --output=temp_interp/run/logs/ll/complete_lr-5e-4_seeds.log
 #SBATCH --cpus-per-task=1
 #SBATCH --time=24:00:00
 #SBATCH --account=rpaleja
@@ -14,11 +14,11 @@ module load conda
 conda activate temp-interp
 export OMP_NUM_THREADS=1
 
-echo "Running ICCT-complete with Action Chunking with seed ${SEED} and method ${METHOD}"
+echo "Running MLP with Action Chunking with seed ${SEED} and method ${METHOD}"
 curr_user=$(whoami)
 
 python -m temp_interp.run.train \
-  --env_name cart \
+  --env_name lunar \
   --abstraction_type ${METHOD} \
   --num_envs 32 \
   --seed ${SEED} \
@@ -27,13 +27,10 @@ python -m temp_interp.run.train \
   --gamma 0.99 \
   --ent-coef 0.0 \
   --eval_freq 1500 \
-  --min_reward 900 \
-  --training_steps 2000000 \
+  --min_reward 225 \
+  --training_steps 3000000 \
   --log_interval 1 \
   --gpu \
-  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ip/ \
-  --use_individual_alpha \
-  --hard_node \
-  --submodels \
-  --sparse_submodel_type 0 \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
   --time_horizon ${TIME} \
+  --mlp_policy_size mid \

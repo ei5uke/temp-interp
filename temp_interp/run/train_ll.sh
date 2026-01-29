@@ -24,3 +24,4 @@ python -m temp_interp.run.train \
   --submodels \
   --sparse_submodel_type 0 \
   --gpu \
+  --time_horizon 1

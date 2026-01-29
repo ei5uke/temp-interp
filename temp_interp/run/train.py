@@ -23,12 +23,6 @@ from stable_baselines3.common.torch_layers import CombinedExtractor, FlattenExtr
 from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
 import temp_interp.envs.lunar_lander_hard
-#### might have issues b/c hpc isn't ubuntu, figure out later
-# from flow.utils.registry import make_create_env
-# from temp_interp.envs.accel_ring import ring_accel_params
-# from temp_interp.envs.accel_ring_multilane import ring_accel_lc_params
-# from temp_interp.envs.accel_figure8 import fig8_params
-####
 
 def make_env(env_id, gamma=None):
     def thunk():
@@ -99,6 +93,7 @@ if __name__ == "__main__":
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
     parser.add_argument('--num_search', help='the number of hyperparameter searches', type=int, default=1)
+    parser.add_argument('--time_horizon', help='the time horizon of the temporal abstraction', type=int, default=10)
 
     args = parser.parse_args()
     assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
@@ -141,7 +136,7 @@ if __name__ == "__main__":
                 'values': [0.2]
             },
             'time_horizon': {
-                'values': [10]
+                'values': [args.time_horizon]
             },
             'num_leaves': {
                 'values': [8]
@@ -167,7 +162,7 @@ if __name__ == "__main__":
 
     def train():
         ## wandb setup
-        run_name = f"{env_id}__{args.seed}__{int(time.time())}"
+        run_name = f"{env_id}__{args.seed}__ICCT_{args.time_horizon}_{int(time.time())}"
         run = wandb.init(name=run_name, sync_tensorboard=True)
         config = wandb.config
 
@@ -257,8 +252,6 @@ if __name__ == "__main__":
                     epsilon=config.epsilon)
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
-    
-    # sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type)
-    sweep_id = wandb.sweep(sweep_config, project="morph")
-    # sweep_id = wandb.sweep(sweep_config, project="debug")
+
+    sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type+"ICCT")
     wandb.agent(sweep_id, function=train, count=args.num_search)

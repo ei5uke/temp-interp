@@ -24,9 +24,9 @@ from stable_baselines3.common.torch_layers import (
 from temp_interp.algos.icct import ICCT
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 
-class ICCTPolicy(BasePolicy):
+class TemporalActorCriticPolicy(BasePolicy):
     """
-    Actor-critic for PPO with ICCT, with Temporal Ensemble.
+    Base Actor-Critic policy with temporal abstraction (action chunking and temporal ensemble).
 
     :param observation_space: Observation space
     :param action_space: Action space
@@ -74,10 +74,10 @@ class ICCTPolicy(BasePolicy):
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
-        ddt_kwargs: Dict[str, Any] = None,
         time_horizon: int = 3,
         abstraction_type: str = 'temp-pred',
         decay: float = 0.0,
+        **kwargs
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -88,7 +88,7 @@ class ICCTPolicy(BasePolicy):
         super().__init__(
             observation_space,
             action_space,
-            FlattenExtractor, # We force dicts to flattened np arrays
+            FlattenExtractor,
             features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
@@ -102,11 +102,11 @@ class ICCTPolicy(BasePolicy):
         new_low = np.tile(action_space.low, time_horizon)
         new_high = np.tile(action_space.high, time_horizon)
 
+        print("Architecture:", net_arch)
+
         self.action_space = spaces.Box(low=new_low, high=new_high, shape=new_shape, dtype=action_space.dtype)
         # self.action_space = action_space
         self.action_dim = get_action_dim(self.action_space)
-        self.ddt_kwargs = ddt_kwargs
-        self.rpo_alpha = 0.5 # Robust Policy Optimization addition
         self.time_horizon = time_horizon # action chunking addition
         self.abstraction_type = abstraction_type # temp-ensemble or temp-pred
         if self.abstraction_type == 'temp-ensemble': 
@@ -137,6 +137,8 @@ class ICCTPolicy(BasePolicy):
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
         self.new_action_net = None # set to None by default. Add a tree when deepening/pruning
+
+        print("Net Arch after: ", self.net_arch)
 
         self.share_features_extractor = share_features_extractor
         self.features_extractor = self.make_features_extractor()
@@ -217,6 +219,23 @@ class ICCTPolicy(BasePolicy):
             device=self.device,
         )
 
+    def _build_action_net(self, latent_dim_pi: int) -> nn.Module:
+        """
+        Build the action network. Must be implemented by subclasses.
+        
+        :param latent_dim_pi: Dimension of the policy latent space
+        :return: Action network module
+        """
+        raise NotImplementedError("Subclasses must implement _build_action_net()")
+
+    def _build_optimizer(self, lr_schedule: Schedule) -> None:
+        """
+        Build optimizer. Can be overridden by subclasses.
+        
+        :param lr_schedule: Learning rate schedule
+        """
+        raise NotImplementedError("Subclasses must implement _build_optimizer()")
+
     def _build(self, lr_schedule: Schedule) -> None:
         """
         Create the networks and the optimizer.
@@ -226,25 +245,30 @@ class ICCTPolicy(BasePolicy):
         """
         self._build_mlp_extractor()
         latent_dim_pi = self.mlp_extractor.latent_dim_pi
-        self.action_net = ICCT(input_dim=latent_dim_pi,
-                        output_dim=self.action_dim,
-                        weights=None,
-                        comparators=None,
-                        leaves=self.ddt_kwargs['num_leaves'],
-                        alpha=None,
-                        paths=None,
-                        submodels=None,
-                        use_individual_alpha=self.ddt_kwargs['use_individual_alpha'],
-                        device=self.ddt_kwargs['device'],
-                        use_submodels=self.ddt_kwargs['submodels'],
-                        hard_node=self.ddt_kwargs['hard_node'],
-                        argmax_tau=self.ddt_kwargs['argmax_tau'],
-                        sparse_submodel_type=self.ddt_kwargs['sparse_submodel_type'],
-                        fs_submodel_version = self.ddt_kwargs['fs_submodel_version'],
-                        l1_hard_attn=self.ddt_kwargs['l1_hard_attn'],
-                        num_sub_features=self.ddt_kwargs['num_sub_features'],
-                        use_gumbel_softmax=self.ddt_kwargs['use_gumbel_softmax'],
-                        alg_type=self.ddt_kwargs['alg_type']).to(self.ddt_kwargs['device']).to(self.device)
+
+        # ICCT
+        # self.action_net = ICCT(input_dim=latent_dim_pi,
+        #                 output_dim=self.action_dim,
+        #                 weights=None,
+        #                 comparators=None,
+        #                 leaves=self.ddt_kwargs['num_leaves'],
+        #                 alpha=None,
+        #                 paths=None,
+        #                 submodels=None,
+        #                 use_individual_alpha=self.ddt_kwargs['use_individual_alpha'],
+        #                 device=self.ddt_kwargs['device'],
+        #                 use_submodels=self.ddt_kwargs['submodels'],
+        #                 hard_node=self.ddt_kwargs['hard_node'],
+        #                 argmax_tau=self.ddt_kwargs['argmax_tau'],
+        #                 sparse_submodel_type=self.ddt_kwargs['sparse_submodel_type'],
+        #                 fs_submodel_version = self.ddt_kwargs['fs_submodel_version'],
+        #                 l1_hard_attn=self.ddt_kwargs['l1_hard_attn'],
+        #                 num_sub_features=self.ddt_kwargs['num_sub_features'],
+        #                 use_gumbel_softmax=self.ddt_kwargs['use_gumbel_softmax'],
+        #                 alg_type=self.ddt_kwargs['alg_type']).to(self.ddt_kwargs['device']).to(self.device)
+
+        # MLP
+        # self.action_net = self._build_action_net(latent_dim_pi)
 
         self.log_std = nn.Parameter(th.ones(self.action_dim) * self.log_std_init, requires_grad=True)
 
@@ -272,7 +296,7 @@ class ICCTPolicy(BasePolicy):
                 module.apply(partial(self.init_weights, gain=gain))
 
         # Setup optimizer with initial learning rate
-        self.optimizer = self.optimizer_class(self.parameters(), lr=self.ddt_kwargs['ddt_lr'], **self.optimizer_kwargs) # this should probs be ddt_kwargs itself
+        self._build_optimizer(lr_schedule)
 
     def clear_lists(self):
         """
@@ -388,25 +412,15 @@ class ICCTPolicy(BasePolicy):
         time_indices = th.arange(n_tensors - 1, -1, -1)
         return stacked_actions, n_tensors, n_envs, time_indices
 
-    def forward_info_bottleneck(self, obs: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
-        Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
+        Return representation for information bottleneck analysis.
+        Must be implemented by subclasses.
 
         :param obs: Observation
-        :return: The batch of leaf probabilities.
+        :return: Representation for mutual information analysis
         """
-        # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        if self.share_features_extractor:
-            latent_pi, _ = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-        if not morphed:
-            input_compressions = self.action_net.forward_input_compressions(latent_pi)
-        else:
-            input_compressions = self.new_action_net.forward_input_compressions(latent_pi)
-        return input_compressions
+        raise NotImplementedError("Subclasses must implement forward_info_bottleneck()")
 
     def extract_features(  # type: ignore[override]
         self, obs: PyTorchObs, features_extractor: Optional[BaseFeaturesExtractor] = None
@@ -432,6 +446,101 @@ class ICCTPolicy(BasePolicy):
             vf_features = super().extract_features(obs, self.vf_features_extractor)
             return pi_features, vf_features
 
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None) -> Distribution:
+        """
+        Retrieve action distribution given the latent codes.
+        If actions is given, then evaluate at the action-level, not the action-chunk-level.
+        Must be implemented by subclasses.
+
+        :param latent_pi: Latent code for the actor
+        :return: Action distribution
+        """
+        raise NotImplementedError("Subclasses must implement _get_action_dist_from_latent()")
+    
+    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
+        """
+        Get the action according to the policy for a given observation.
+
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+        return self.get_distribution(observation).get_actions(deterministic=deterministic)
+
+    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+
+        :param obs: Observation
+        :param actions: Actions
+        :return: estimated value, log likelihood of taking those actions
+            and entropy of the action distribution.
+        """
+        raise NotImplementedError("Subclasses must implement _get_action_dist_from_latent()")
+
+    def get_distribution(self, obs: PyTorchObs) -> Distribution:
+        """
+        Get the current policy distribution given the observations.
+
+        :param obs:
+        :return: the action distribution.
+        """
+        features = super().extract_features(obs, self.pi_features_extractor)
+        latent_pi = self.mlp_extractor.forward_actor(features)
+        return self._get_action_dist_from_latent(latent_pi)
+
+    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs: Observation
+        :return: the estimated values.
+        """
+        features = super().extract_features(obs, self.vf_features_extractor)
+        latent_vf = self.mlp_extractor.forward_critic(features)
+        return self.value_net(latent_vf)
+
+
+class ICCTPolicy(TemporalActorCriticPolicy):
+    """
+    Actor-critic for PPO with ICCT, with Temporal Ensemble.
+    """
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        ddt_kwargs: Dict[str, Any] = None,
+        **kwargs
+    ):
+        self.ddt_kwargs = ddt_kwargs
+        self.rpo_alpha = 0.5 # Robust Policy Optimization addition
+        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
+
+    def _build_action_net(self, latent_dim_pi: int) -> nn.Module:
+        return ICCT(input_dim=latent_dim_pi,
+                        output_dim=self.action_dim,
+                        weights=None,
+                        comparators=None,
+                        leaves=self.ddt_kwargs['num_leaves'],
+                        alpha=None,
+                        use_individual_alpha=self.ddt_kwargs['use_individual_alpha'],
+                        device=self.ddt_kwargs['device'],
+                        use_submodels=self.ddt_kwargs['submodels'],
+                        hard_node=self.ddt_kwargs['hard_node'],
+                        argmax_tau=self.ddt_kwargs['argmax_tau'],
+                        sparse_submodel_type=self.ddt_kwargs['sparse_submodel_type'],
+                        fs_submodel_version = self.ddt_kwargs['fs_submodel_version'],
+                        l1_hard_attn=self.ddt_kwargs['l1_hard_attn'],
+                        num_sub_features=self.ddt_kwargs['num_sub_features'],
+                        use_gumbel_softmax=self.ddt_kwargs['use_gumbel_softmax'],
+                        alg_type=self.ddt_kwargs['alg_type']).to(self.ddt_kwargs['device']).to(self.device)
+
+    def _build_optimizer(self, lr_schedule: Schedule) -> None:
+        self.optimizer = self.optimizer_class(self.parameters(), lr=self.ddt_kwargs['ddt_lr'], **self.optimizer_kwargs)
+
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None, morphed=False) -> Distribution:
         """
         Retrieve action distribution given the latent codes.
@@ -449,16 +558,6 @@ class ICCTPolicy(BasePolicy):
             z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
             mean_actions = mean_actions + z
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
-    
-    def _predict(self, observation: PyTorchObs, deterministic: bool = False) -> th.Tensor:
-        """
-        Get the action according to the policy for a given observation.
-
-        :param observation:
-        :param deterministic: Whether to use stochastic or deterministic actions
-        :return: Taken action according to the policy
-        """
-        return self.get_distribution(observation).get_actions(deterministic=deterministic)
 
     def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
@@ -492,24 +591,75 @@ class ICCTPolicy(BasePolicy):
         entropy = distribution.entropy()
         return values, log_prob, entropy
 
-    def get_distribution(self, obs: PyTorchObs) -> Distribution:
+    def forward_info_bottleneck(self, obs: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
-        Get the current policy distribution given the observations.
-
-        :param obs:
-        :return: the action distribution.
-        """
-        features = super().extract_features(obs, self.pi_features_extractor)
-        latent_pi = self.mlp_extractor.forward_actor(features)
-        return self._get_action_dist_from_latent(latent_pi)
-
-    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
-        """
-        Get the estimated values according to the current policy given the observations.
+        Return the leaf probabilities outputted by the DDT to use as a sufficient statistic for the information bottleneck
 
         :param obs: Observation
-        :return: the estimated values.
+        :return: The batch of leaf probabilities.
         """
-        features = super().extract_features(obs, self.vf_features_extractor)
-        latent_vf = self.mlp_extractor.forward_critic(features)
-        return self.value_net(latent_vf)
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, _ = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        if not morphed:
+            input_compressions = self.action_net.forward_input_compressions(latent_pi)
+        else:
+            input_compressions = self.new_action_net.forward_input_compressions(latent_pi)
+        return input_compressions
+
+class MLPPolicyAC(TemporalActorCriticPolicy):
+    """
+    Actor-critic MLP policy for PPO.
+    """        
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule: Schedule,
+        l1_reg_coeff: float = 0.0,
+        **kwargs
+    ):
+        self.rpo_alpha = 0.5
+        self.l1_reg_coeff = l1_reg_coeff
+        super().__init__(observation_space, action_space, lr_schedule, **kwargs)
+        
+    def _build_action_net(self, latent_dim_pi: int) -> nn.Module:
+        return nn.Linear(latent_dim_pi, self.action_dim)
+
+    def _build_optimizer(self, lr_schedule: Schedule) -> None:
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor, actions: th.Tensor = None) -> Distribution:
+        """
+        Retrieve action distribution given the latent codes.
+
+        :param latent_pi: Latent code for the actor
+        :return: Action distribution
+        """
+        mean_actions = self.action_net(latent_pi)
+        if actions is not None:
+            z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
+            mean_actions = mean_actions + z
+        
+        return self.action_dist.proba_distribution(mean_actions, self.log_std)
+
+    def forward_info_bottleneck(self, obs: th.Tensor) -> th.Tensor:
+        """
+        Return the latent representation for information bottleneck analysis.
+
+        :param obs: Observation
+        :return: The latent representation.
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, _ = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        return latent_pi

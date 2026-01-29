@@ -14,10 +14,10 @@ module load conda
 conda activate temp-interp
 export OMP_NUM_THREADS=1
 
-echo "Running ICCT-complete with Action Chunking with seed ${SEED} and method ${METHOD}"
+echo "Running MLP with Action Chunking with seed ${SEED} and method ${METHOD}"
 curr_user=$(whoami)
 
-python -m temp_interp.run.train \
+python -m temp_interp.run.train_mlp \
   --env_name cart \
   --abstraction_type ${METHOD} \
   --num_envs 32 \
@@ -32,8 +32,5 @@ python -m temp_interp.run.train \
   --log_interval 1 \
   --gpu \
   --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ip/ \
-  --use_individual_alpha \
-  --hard_node \
-  --submodels \
-  --sparse_submodel_type 0 \
   --time_horizon ${TIME} \
+  --mlp_policy_size mid \

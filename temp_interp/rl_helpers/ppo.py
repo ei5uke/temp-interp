@@ -23,7 +23,7 @@ from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.save_util import load_from_zip_file, recursive_getattr, recursive_setattr, save_to_zip_file
 from stable_baselines3.common.vec_env.patch_gym import _convert_space
 
-from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy
+from temp_interp.rl_helpers.policies import BasePolicy, ICCTPolicy, MLPPolicyAC
 from temp_interp.rl_helpers.buffers import TemporalRolloutBuffer
 from temp_interp.algos.icct_helpers import deepen_icct, prune_icct
 
@@ -87,11 +87,12 @@ class PPO(OnPolicyAlgorithm):
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "ICCTPolicy": ICCTPolicy,
+        "MLPPolicy": MLPPolicyAC,
     }
 
     def __init__(
         self,
-        policy: Union[str, type[ICCTPolicy]],
+        policy: Union[str, type[ICCTPolicy], type[MLPPolicyAC]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         n_steps: int = 2048,
@@ -121,6 +122,8 @@ class PPO(OnPolicyAlgorithm):
         curriculum_coef: Union[float, Schedule] = 1.0,
         epsilon: float = 0.05, # the minimum average gradient that must be observed to incentivize morph.
     ):
+        if isinstance(policy, str) and policy in self.policy_aliases:
+            policy = self.policy_aliases[policy]
         super().__init__(
             policy,
             env,
@@ -183,21 +186,28 @@ class PPO(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.method = method
         self.curriculum_coef = curriculum_coef
-
+        self.policy_name = policy
         if _init_setup_model:
             self._setup_model()
+
+        # morph
             # project actions, states, and leaf probabilities to the same dimension (the average of the dimension spaces)
-            self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+            if self.policy_name == "ICCTPolicy" or isinstance(self.policy, ICCTPolicy):
+                self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim + self.policy.action_net.num_leaves) // 3
+            else:
+                self.dim_common = (self.policy.flattened_obs_dim + self.policy.action_dim) // 2
             self.state_proj = th.nn.Linear(self.policy.flattened_obs_dim, self.dim_common).to(device)
             self.action_chunk_proj = th.nn.Linear(self.policy.action_dim, self.dim_common).to(device)
             self.action_proj = th.nn.Linear(self.policy.og_action_dim, self.dim_common).to(device)
-            self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
+            if self.policy_name == "ICCTPolicy" or isinstance(self.policy, ICCTPolicy):
+                self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(device)
             self.policy_complexities = []
 
             # only add if we are storing the flattened action to the buffer instead 
             # of the temporal ensemble action
             self.rollout_buffer.action_dim = self.policy.action_dim
             self.rollout_buffer.og_action_dim = self.policy.og_action_dim
+            self.rollout_buffer.abstraction_type = self.policy.abstraction_type
             if self.policy.abstraction_type == 'temp-pred': self.rollout_buffer.log_prob_dim = self.policy.action_dim 
 
         # deepening / pruning variables
@@ -343,7 +353,7 @@ class PPO(OnPolicyAlgorithm):
         # curr_level = 1 + int((1 - self._current_progress_remaining) * self.policy.time_horizon) # 1->0
 
         entropy_losses = []
-        pg_losses, value_losses = [], []
+        pg_losses, value_losses, total_losses = [], [], []
         if self.policy.abstraction_type == 'temp-pred': pred_losses = []
         ratios = []
         clip_fractions = []
@@ -451,13 +461,14 @@ class PPO(OnPolicyAlgorithm):
             self.policy_complexities.append(policy_complexity)
             self.logger.record(f"train/I(S;A)", policy_complexity)
             self.logger.record(f"train/I(S;AC)", self._estimate_mutual_info(s_proj, ac_proj))
+            # information bottleneck no layers
 
-            # Information bottleneck
-            leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
-            t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
-            self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
-            self.logger.record(f"train/I(T;A)", self._estimate_mutual_info(t_proj, a_proj))
-            self.logger.record(f"train/I(T;AC)", self._estimate_mutual_info(t_proj, ac_proj))
+            if self.policy_name == "ICCTPolicy" or isinstance(self.policy, ICCTPolicy):
+                leaf_probs = self.policy.forward_info_bottleneck(obs_batch)
+                t_proj = F.normalize(self.leaf_proj(leaf_probs), dim=1)
+                self.logger.record(f"train/I(S;T)", self._estimate_mutual_info(s_proj, t_proj))
+                self.logger.record(f"train/I(T;A)", self._estimate_mutual_info(t_proj, a_proj))
+                self.logger.record(f"train/I(T;AC)", self._estimate_mutual_info(t_proj, ac_proj))
 
         # Logs
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
@@ -471,7 +482,8 @@ class PPO(OnPolicyAlgorithm):
         # self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
-        self.logger.record("train/num_leaves", int(self.policy.action_net.num_leaves))
+        if type(self.policy) is ICCTPolicy:
+            self.logger.record("train/num_leaves", int(self.policy.action_net.num_leaves))
 
         # self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         # self.logger.record("train/clip_range", clip_range)
@@ -517,6 +529,16 @@ class PPO(OnPolicyAlgorithm):
                 l1_reg_loss *= self.policy.ddt_kwargs['l1_reg_coeff'] * self.policy.ddt.leaf_attn.size(0)
                 l1_reg_losses.append(l1_reg_loss.item())
                 policy_loss += l1_reg_loss
+        # MLP L1 Regularization
+        elif isinstance(self.policy, MLPPolicyAC) and getattr(self.policy, 'l1_reg_coeff', 0) > 0:
+            l1_loss = 0
+            # Regularize the policy hidden layers (body)
+            for param in self.policy.mlp_extractor.policy_net.parameters():
+                l1_loss += th.sum(th.abs(param))
+            # Regularize the policy output layer (head)
+            for param in action_net.parameters():
+                l1_loss += th.sum(th.abs(param))
+            policy_loss += self.policy.l1_reg_coeff * l1_loss
 
         losses = {'policy_loss': policy_loss, 'ratio': ratio}
 

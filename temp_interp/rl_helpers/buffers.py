@@ -73,6 +73,7 @@ class BaseBuffer(ABC):
         self.pos = 0
         self.full = False
         self.device = get_device(device)
+        self.abstraction_type = None
         self.n_envs = n_envs
 
     @staticmethod
@@ -341,7 +342,7 @@ class TemporalRolloutBuffer(BaseBuffer):
         batch_inds: np.ndarray,
         env: Optional[VecNormalize] = None,
     ) -> Union[RolloutBufferSamples, TemporalRolloutBufferSamples]:
-        if self.log_prob_dim == 1: # temp-ensemble
+        if self.abstraction_type == "temp-ensemble":
             data = (
                 self.observations[batch_inds],
                 # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
@@ -352,7 +353,7 @@ class TemporalRolloutBuffer(BaseBuffer):
                 self.returns[batch_inds].flatten(),
             )
             return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
-        elif self.log_prob_dim == self.action_dim: # temp-pred
+        elif self.abstraction_type == "temp-pred":
             # account for timesteps which do not have enough predictions before them so pad with zero vectors
             # need to adjust the indices for these zero vectors
             num_preds = self.action_dim // self.og_action_dim - 1
@@ -373,4 +374,5 @@ class TemporalRolloutBuffer(BaseBuffer):
                 self.advantages[batch_inds].flatten(),
                 self.returns[batch_inds].flatten(),
             )
+            # print("Using TemporalRolloutBufferSamples in temp-pred")
             return TemporalRolloutBufferSamples(*tuple(map(self.to_torch, data)))
