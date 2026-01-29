@@ -25,12 +25,16 @@ from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.torch_layers import CombinedExtractor, FlattenExtractor
 from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
-from temp_interp.algos.icct_helpers import convert_to_crisp
 import temp_interp.envs.lunar_lander_hard
 
-def make_env(env_id):
+def make_env(env_id, gamma=None):
     def thunk():
-        env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
+        if env_id == 'figure8':
+            create_env, _ = make_create_env(params=fig8_params, version=0)
+            env = create_env()
+        elif env_id == 'LunarLanderHard': 
+            env = gym.make(env_id, continuous=True, enable_wind=True, wind_power=20.0, turbulence_power=2.0)
+        else: env = gym.make(env_id)
         env = gym.wrappers.FlattenObservation(env) # change Dict to nparray
         return env
     return thunk
@@ -68,7 +72,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     set_random_seed(args.seed)
-    env_id = 'LunarLanderHard'
+    env_id = 'LunarLanderContinuous-v3'
+    # env_id = 'LunarLanderHard'
+    # env_id = 'lane-keeping-v0'
+    # env_id = 'InvertedPendulum-v5'
     env = make_env(env_id)()
 
     # debug
@@ -121,6 +128,9 @@ if __name__ == "__main__":
 
     # load model
     model = PPO.load(args.load_path + "/" + args.load_file, env=env)
+    # print(sum(p.numel() for p in model.policy.action_net.parameters()))
+    # print(sum(p.numel() for p in model.policy.action_net.lin_models.parameters()))
+    # exit()
     # model.policy.action_net.debug()
 
     # deployment loop to check for confusion matrix

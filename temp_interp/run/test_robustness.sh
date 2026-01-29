@@ -6,10 +6,10 @@ curr_user=$(whoami)
 # export CUDA_VISIBLE_DEVICES=1
 
 python -m temp_interp.run.test_robustness \
-  --seed 13 \
-  --load_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll_hard \
-  --load_file best_model \
-  --num_episodes 1 \
+  --seed 0 \
+  --load_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll_hard/temp-NoAC/ \
+  --load_file best_model_seed0 \
+  --num_episodes 100 \
   --abstraction_type temp-pred \
   --n_steps 2048 \
   --batch_size 256 \
@@ -19,4 +19,3 @@ python -m temp_interp.run.test_robustness \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
-  | tee test_robustness.log
