@@ -31,6 +31,7 @@ class RolloutBufferSamples(NamedTuple):
 class TemporalRolloutBufferSamples(NamedTuple):
     observations: th.Tensor
     past_observations: th.Tensor
+    past_mask: th.Tensor
     actions: th.Tensor
     old_values: th.Tensor
     old_log_prob: th.Tensor
@@ -342,37 +343,36 @@ class TemporalRolloutBuffer(BaseBuffer):
         batch_inds: np.ndarray,
         env: Optional[VecNormalize] = None,
     ) -> Union[RolloutBufferSamples, TemporalRolloutBufferSamples]:
+        # account for timesteps which do not have enough predictions before them so pad with zero vectors
+        # need to adjust the indices for these zero vectors
+        num_preds = self.action_dim // self.og_action_dim - 1
+        zero_obs = np.zeros((self.n_envs, num_preds, *self.obs_shape))
+        concat_obs = np.concat((zero_obs, self.observations.reshape(self.n_envs, -1, *self.obs_shape)), axis=1).reshape(-1, *self.obs_shape)
+        tmp_idcs = []
+        for idx in batch_inds:
+            num_zero_vecs_added = ((idx // (self.buffer_size))+1) * num_preds
+            for t in range(num_preds, 0, -1):
+                tmp_idcs.append(idx + num_zero_vecs_added - t)
+        # a past observation is valid only if it is inside this rollout and in the same episode as s_t
+        env_inds, step_inds = batch_inds // self.buffer_size, batch_inds % self.buffer_size
+        past_steps = step_inds[:, None] - np.arange(num_preds, 0, -1)
+        episode_count = np.cumsum(self.episode_starts, axis=0)
+        same_episode = episode_count[step_inds, env_inds][:, None] == episode_count[np.maximum(past_steps, 0), env_inds[:, None]]
+        past_mask = ((past_steps >= 0) & same_episode).astype(np.float32)
         if self.abstraction_type == "temp-ensemble":
-            data = (
-                self.observations[batch_inds],
-                # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
-                self.actions[batch_inds].astype(np.float32, copy=False),
-                self.values[batch_inds].flatten(),
-                self.log_probs[batch_inds].flatten(),
-                self.advantages[batch_inds].flatten(),
-                self.returns[batch_inds].flatten(),
-            )
-            return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+            log_probs = self.log_probs[batch_inds].flatten()
         elif self.abstraction_type == "temp-pred":
-            # account for timesteps which do not have enough predictions before them so pad with zero vectors
-            # need to adjust the indices for these zero vectors
-            num_preds = self.action_dim // self.og_action_dim - 1
-            zero_obs = np.zeros((self.n_envs, num_preds, *self.obs_shape))
-            concat_obs = np.concat((zero_obs, self.observations.reshape(self.n_envs, -1, *self.obs_shape)), axis=1).reshape(-1, *self.obs_shape)
-            tmp_idcs = []
-            for idx in batch_inds:
-                num_zero_vecs_added = ((idx // (self.buffer_size))+1) * num_preds
-                for t in range(num_preds, 0, -1):
-                    tmp_idcs.append(idx + num_zero_vecs_added - t)
-            data = (
-                self.observations[batch_inds],
-                concat_obs[tmp_idcs],
-                # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
-                self.actions[batch_inds].astype(np.float32, copy=False),
-                self.values[batch_inds].flatten(),
-                self.log_probs[batch_inds].reshape(-1, self.action_dim // self.og_action_dim, self.og_action_dim), # self.log_probs[batch_inds].flatten(),
-                self.advantages[batch_inds].flatten(),
-                self.returns[batch_inds].flatten(),
-            )
-            # print("Using TemporalRolloutBufferSamples in temp-pred")
-            return TemporalRolloutBufferSamples(*tuple(map(self.to_torch, data)))
+            log_probs = self.log_probs[batch_inds].reshape(-1, self.action_dim // self.og_action_dim, self.og_action_dim)
+        data = (
+            self.observations[batch_inds],
+            # past observations s_{t-H+1}, ..., s_{t-1} (oldest first), flattened over the batch
+            concat_obs[tmp_idcs],
+            past_mask,
+            # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
+            self.actions[batch_inds].astype(np.float32, copy=False),
+            self.values[batch_inds].flatten(),
+            log_probs,
+            self.advantages[batch_inds].flatten(),
+            self.returns[batch_inds].flatten(),
+        )
+        return TemporalRolloutBufferSamples(*tuple(map(self.to_torch, data)))

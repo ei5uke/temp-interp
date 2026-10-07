@@ -29,6 +29,17 @@ from temp_interp.algos.icct_helpers import deepen_icct, prune_icct
 
 SelfPPO = TypeVar("SelfPPO", bound="PPO")
 
+# Information-Theoretic Tree Restructuring (ITTR) settings, see Table 5 of the paper.
+DEFAULT_ITTR_KWARGS = {
+    'min_headstart': 10000,       # m: minimum global steps before any restructuring
+    'min_timesteps': 1000,        # n: minimum steps since the last restructuring
+    'min_evaluations': 4,         # minimum number of policy complexity estimates before restructuring
+    'min_visitations': 1e5,       # k: prune a leaf visited fewer than k times
+    'low_return_stat': 'mean',    # 'mean' or 'frac_positive' of the rollout returns
+    'low_return_threshold': 0.0,  # rewards are low if the statistic is below this threshold
+    'prune_first': False,         # check pruning before deepening
+}
+
 class PPO(OnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
@@ -121,6 +132,8 @@ class PPO(OnPolicyAlgorithm):
         method: str = 'pred',
         curriculum_coef: Union[float, Schedule] = 1.0,
         epsilon: float = 0.05, # the minimum average gradient that must be observed to incentivize morph.
+        pred_coef: float = 1.0, # scaling coefficient lambda of the temporal prediction objective
+        ittr_kwargs: Optional[dict[str, Any]] = None,
     ):
         if isinstance(policy, str) and policy in self.policy_aliases:
             policy = self.policy_aliases[policy]
@@ -186,6 +199,8 @@ class PPO(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.method = method
         self.curriculum_coef = curriculum_coef
+        self.pred_coef = pred_coef
+        self.ittr_kwargs = {**DEFAULT_ITTR_KWARGS, **(ittr_kwargs or {})}
         self.policy_name = policy
         if _init_setup_model:
             self._setup_model()
@@ -285,8 +300,7 @@ class PPO(OnPolicyAlgorithm):
                             self.policy.og_action_dim))[:, :self.policy.og_action_dim]
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
-
-            # print("New Obs: ", new_obs)
+            if self.policy.abstraction_type == 'temp-ensemble': self.policy.reset_ensemble(dones)
 
             self.num_timesteps += env.num_envs
 
@@ -359,10 +373,11 @@ class PPO(OnPolicyAlgorithm):
         clip_fractions = []
 
         # deepen / prune the tree
-        morph_batch = next(self.rollout_buffer.get(self.env.num_envs * self.n_steps))
-        method = self._check_morph(morph_batch.returns)
-        if method is not None:
-            self._morph(method)
+        if isinstance(self.policy, ICCTPolicy):
+            morph_batch = next(self.rollout_buffer.get(self.env.num_envs * self.n_steps))
+            method = self._check_morph(morph_batch.returns)
+            if method is not None:
+                self._morph(method)
 
         continue_training = True
         # train for n_epochs epochs
@@ -377,7 +392,7 @@ class PPO(OnPolicyAlgorithm):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions, rollout_data.past_observations)
                 values = values.flatten()
 
                 # Policy loss
@@ -418,8 +433,7 @@ class PPO(OnPolicyAlgorithm):
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
                 if self.policy.abstraction_type == 'temp-pred' and self.policy.time_horizon > 1: 
-                    scale = 0.005 # for LL-H; 1 for everything else
-                    loss += scale * temp_pred_loss
+                    loss += self.pred_coef * temp_pred_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -550,10 +564,11 @@ class PPO(OnPolicyAlgorithm):
             _, pred_log_prob, _ = self.policy.evaluate_actions(rollout_data.past_observations, 
                 curr_action.repeat_interleave(self.policy.time_horizon - 1, dim=0))
             pred_log_prob = pred_log_prob.reshape(pred_log_prob.shape[0], self.policy.time_horizon, self.policy.og_action_dim).sum(dim=-1)
-            idcs = th.tensor(th.arange(self.policy.time_horizon-1, 0, step=-1).reshape(-1, 1).tolist()*self.batch_size).to(pred_log_prob.device)
+            idcs = th.arange(self.policy.time_horizon-1, 0, step=-1).repeat(len(curr_action)).reshape(-1, 1).to(pred_log_prob.device)
             pred_log_prob = th.gather(pred_log_prob, 1, idcs).reshape(-1, self.policy.time_horizon - 1)
-            # curr_level is a curriculum parameter. Increase horizon length for prediction later on in training.
-            temp_pred_loss = (1 - self._current_progress_remaining) * -pred_log_prob.mean()
+            # ignore past states from a previous episode or before the rollout
+            past_mask = rollout_data.past_mask
+            temp_pred_loss = -(pred_log_prob * past_mask).sum() / past_mask.sum().clamp(min=1.0)
             losses['temp_pred_loss'] = temp_pred_loss
         return losses
 
@@ -571,44 +586,35 @@ class PPO(OnPolicyAlgorithm):
         loss = (loss_A_B + loss_B_A) / 2
         return np.log(self.batch_size) - loss.cpu().item()
 
-    def _check_morph(self, returns, min_headstart=10000, min_timesteps=1000, min_evaluations=4): # ll, ll-h
-    # def _check_morph(self, returns, min_headstart=6000, min_timesteps=600, min_evaluations=3): # ip
-    # def _check_morph(self, returns, min_headstart=2000, min_timesteps=200, min_evaluations=2): # lk
-    # def _check_morph(self, returns, min_headstart=1000, min_timesteps=500, min_evaluations=1): # debugging
+    def _check_morph(self, returns):
         """
-        Check whether we should morph (deepen or prune) the tree. Return whether to deepen or prune if enough timesteps 
+        Check whether we should morph (deepen or prune) the tree. Return whether to deepen or prune if enough timesteps
         have passed and if the policy complexities have, on-average, been increasing / decreasing by more than epsilon.
+        The thresholds and rules are given by ``self.ittr_kwargs`` (see ``DEFAULT_ITTR_KWARGS``).
 
-        :param timesteps: the current number of timesteps completed in PPO since the last morph step.
-        :param min_headstart: the minimum number of timesteps before we can even allow morph.
-        :param min_timesteps: the minimum number of timesteps between each morph session.
-        :param min_evaluations: the minimum number of policy complexity evaluations performed before morphing
+        :param returns: the returns of the current rollout buffer, used to decide whether rewards are low.
         """
+        ittr = self.ittr_kwargs
         print(f"visitations: {self.policy.action_net.visitations}", flush=True)
-        if self.num_timesteps > min_headstart and (self.num_timesteps - min_timesteps) > self.last_morph_timestep and len(self.policy_complexities) > min_evaluations:
+        if self.num_timesteps > ittr['min_headstart'] and (self.num_timesteps - ittr['min_timesteps']) > self.last_morph_timestep and len(self.policy_complexities) > ittr['min_evaluations']:
             trend = np.mean(np.gradient(self.policy_complexities))
             print(f"trend: {trend}, returns: {returns.mean().item()}", flush=True)
 
-            # if IP, LL, or LK:
-            # if trend < self.epsilon and returns.mean().item() < 0: # IP, LL
-            # if trend < self.epsilon and returns.mean().item() < -0.3: # LK
-            #     self.policy_complexities = []
-            #     return 'deepen'
-            # elif self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) <= 1e5:
-            #     self.policy_complexities = []
-            #     return 'prune'
+            if ittr['low_return_stat'] == 'mean':
+                low_return = returns.mean().item() < ittr['low_return_threshold']
+            elif ittr['low_return_stat'] == 'frac_positive':
+                low_return = (returns > 0).float().mean().item() < ittr['low_return_threshold']
+            else:
+                raise ValueError(f"Unknown low_return_stat: {ittr['low_return_stat']}")
+            deepen = trend < self.epsilon and low_return
+            prune = self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) < ittr['min_visitations']
 
-            # if LL-H:
-            if self.policy.action_net.num_leaves > 2 and np.min(self.policy.action_net.visitations) <= 1e5:
+            if prune and (ittr['prune_first'] or not deepen):
                 self.policy_complexities = []
                 return 'prune'
-            elif trend < self.epsilon and (returns > 0).sum().item() < returns.shape[0] // 2:
+            if deepen:
                 self.policy_complexities = []
                 return 'deepen'
-
-            # # debugging
-            # self.policy_complexities = []
-            # return 'deepen'
         return None
 
     def _morph(self, method):
@@ -631,14 +637,23 @@ class PPO(OnPolicyAlgorithm):
         else:
             print("Error in _morph", flush=True)
             exit()
-        self.policy.action_net = self.policy.new_action_net
+        self.set_action_net(self.policy.new_action_net)
         self.policy.new_action_net = None
         self.last_morph_timestep = self.num_timesteps
+        print("***Completed.***", flush=True)
+
+    def set_action_net(self, action_net):
+        """
+        Replace the policy's tree (after deepening / pruning, or to warm start from a distilled tree)
+        and rebuild the modules and optimizer that depend on its parameters.
+
+        :param action_net: the new ICCT
+        """
+        self.policy.action_net = action_net.to(self.device)
         self.leaf_proj = th.nn.Linear(self.policy.action_net.num_leaves, self.dim_common).to(self.device)
         curr_optimizer_lr = self.policy.optimizer.param_groups[0]['lr']
         self.policy.optimizer = type(self.policy.optimizer)(self.policy.parameters(), **self.policy.optimizer.defaults)
         self.policy.optimizer.param_groups[0]['lr'] = curr_optimizer_lr
-        print("***Completed.***", flush=True)
 
     def learn(
         self: SelfPPO,
@@ -771,7 +786,9 @@ class PPO(OnPolicyAlgorithm):
 
         # Remove stored device information and replace with ours
         if "policy_kwargs" in data:
-            data["policy_kwargs"]["ddt_kwargs"]["num_leaves"] = 3 # this should be whatever the final number of leaves is
+            if "action_net.comparators" in params["policy"]:
+                # rebuild the tree with its saved (possibly restructured) number of leaves
+                data["policy_kwargs"]["ddt_kwargs"]["num_leaves"] = params["policy"]["action_net.comparators"].shape[0] + 1
             if "device" in data["policy_kwargs"]:
                 del data["policy_kwargs"]["device"]
             # backward compatibility, convert to new format
@@ -863,6 +880,14 @@ class PPO(OnPolicyAlgorithm):
                 )
             else:
                 raise e
+
+        # restore the leaf structure of a restructured tree from its saved path signatures
+        if isinstance(model.policy, ICCTPolicy):
+            tree = model.policy.action_net
+            tree.leaf_init_information = [
+                [th.nonzero(tree.left_path_sigs[:, leaf]).flatten().tolist(), th.nonzero(tree.right_path_sigs[:, leaf]).flatten().tolist()]
+                for leaf in range(tree.num_leaves)
+            ]
 
         # put other pytorch variables back in place
         if pytorch_variables is not None:

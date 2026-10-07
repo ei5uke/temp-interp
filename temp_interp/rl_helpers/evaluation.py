@@ -95,11 +95,14 @@ def evaluate_policy_A(
     states = None
     episode_starts = np.ones((env.num_envs,), dtype=bool)
     prev_chunks = deque(maxlen=model.policy.time_horizon-1)
-    if model.policy.abstraction_type == 'temp-ensemble': model.policy.past_eval_actions.clear()
+    if model.policy.abstraction_type == 'temp-ensemble':
+        model.policy.past_eval_actions.clear()
+        model.policy.past_eval_valid.clear()
     device = next(model.policy.parameters()).device
     while (episode_counts < episode_count_targets).any():
         actions = model.policy(th.tensor(observations).to(device), deterministic=deterministic).cpu().detach().numpy()
         new_observations, rewards, dones, infos = env.step(actions[:, :model.policy.og_action_dim]) # indexing necessary for temp-pred
+        if model.policy.abstraction_type == 'temp-ensemble': model.policy.reset_ensemble(dones, deterministic=True)
         current_rewards += rewards
         current_lengths += 1
         # here add new action prediction error

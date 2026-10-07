@@ -109,12 +109,16 @@ class TemporalActorCriticPolicy(BasePolicy):
         self.action_dim = get_action_dim(self.action_space)
         self.time_horizon = time_horizon # action chunking addition
         self.abstraction_type = abstraction_type # temp-ensemble or temp-pred
-        if self.abstraction_type == 'temp-ensemble': 
+        if self.abstraction_type == 'temp-ensemble':
             self.past_actions = deque(maxlen=self.time_horizon)
             self.past_eval_actions = deque(maxlen=self.time_horizon) # separate history necessary for evaluation
             self.past_log_probs = deque(maxlen=self.time_horizon)
-            self.exponential_weighting = th.pow(decay, th.arange(self.time_horizon)).flip(dims=[0])
-            self.exponential_weighting = self.exponential_weighting / th.sum(self.exponential_weighting)
+            # per-env validity of each stored chunk, zeroed when its episode ends
+            self.past_valid = deque(maxlen=self.time_horizon)
+            self.past_eval_valid = deque(maxlen=self.time_horizon)
+            # EMA weight of a chunk by its age (age 0 = chunk sampled at the current timestep).
+            # Normalized over the valid chunks at each timestep.
+            self.exponential_weighting = th.pow(decay, th.arange(self.time_horizon, dtype=th.float32))
 
         if isinstance(net_arch, list) and len(net_arch) > 0 and isinstance(net_arch[0], dict):
             warnings.warn(
@@ -245,30 +249,7 @@ class TemporalActorCriticPolicy(BasePolicy):
         """
         self._build_mlp_extractor()
         latent_dim_pi = self.mlp_extractor.latent_dim_pi
-
-        # ICCT
-        # self.action_net = ICCT(input_dim=latent_dim_pi,
-        #                 output_dim=self.action_dim,
-        #                 weights=None,
-        #                 comparators=None,
-        #                 leaves=self.ddt_kwargs['num_leaves'],
-        #                 alpha=None,
-        #                 paths=None,
-        #                 submodels=None,
-        #                 use_individual_alpha=self.ddt_kwargs['use_individual_alpha'],
-        #                 device=self.ddt_kwargs['device'],
-        #                 use_submodels=self.ddt_kwargs['submodels'],
-        #                 hard_node=self.ddt_kwargs['hard_node'],
-        #                 argmax_tau=self.ddt_kwargs['argmax_tau'],
-        #                 sparse_submodel_type=self.ddt_kwargs['sparse_submodel_type'],
-        #                 fs_submodel_version = self.ddt_kwargs['fs_submodel_version'],
-        #                 l1_hard_attn=self.ddt_kwargs['l1_hard_attn'],
-        #                 num_sub_features=self.ddt_kwargs['num_sub_features'],
-        #                 use_gumbel_softmax=self.ddt_kwargs['use_gumbel_softmax'],
-        #                 alg_type=self.ddt_kwargs['alg_type']).to(self.ddt_kwargs['device']).to(self.device)
-
-        # MLP
-        # self.action_net = self._build_action_net(latent_dim_pi)
+        self.action_net = self._build_action_net(latent_dim_pi)
 
         self.log_std = nn.Parameter(th.ones(self.action_dim) * self.log_std_init, requires_grad=True)
 
@@ -304,6 +285,19 @@ class TemporalActorCriticPolicy(BasePolicy):
         """
         self.past_actions.clear()
         self.past_log_probs.clear()
+        self.past_valid.clear()
+
+    def reset_ensemble(self, dones: np.ndarray, deterministic: bool = False) -> None:
+        """
+        Invalidate the stored chunks of every env whose episode just ended,
+        so that chunks from a finished episode are not ensembled into the next one.
+
+        :param dones: done flag for each env
+        :param deterministic: reset the evaluation history instead of the training history
+        """
+        dones = th.as_tensor(np.asarray(dones, dtype=bool))
+        for valid in (self.past_eval_valid if deterministic else self.past_valid):
+            valid[dones.to(valid.device)] = 0.0
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -341,13 +335,16 @@ class TemporalActorCriticPolicy(BasePolicy):
             chunked_log_prob = log_prob.reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=2).transpose(0,1) 
             
             # Perform ensemble
+            valid = th.ones(chunked_action.shape[1], device=chunked_action.device)
             if not deterministic: # training
                 self.past_actions.append(chunked_action)
                 self.past_log_probs.append(chunked_log_prob)
+                self.past_valid.append(valid)
                 (ensemble_action, ensemble_log, flattened_actions) = self._temporal_ensemble()
                 return ensemble_action, values, ensemble_log, flattened_actions
             else: # evaluating
                 self.past_eval_actions.append(chunked_action)
+                self.past_eval_valid.append(valid)
                 ensemble_action = self._temporal_ensemble(deterministic=True)
                 return ensemble_action
         elif self.abstraction_type == 'temp-pred':
@@ -364,53 +361,45 @@ class TemporalActorCriticPolicy(BasePolicy):
         Aggregates actions across multiple timesteps into one tensor of shape [n_envs, orig_action_dim] which represents an aggregated action for each env at a particular timestep
 
         Aggregated similarly for log probs but returns a tensor of shape [n_envs] with the aggregated probs across timesteps
+
+        Chunks invalidated by ``reset_ensemble`` are excluded, and the EMA weights are normalized over the
+        remaining chunks. The flattened actions are ordered by chunk age (newest first) and zeroed for invalid chunks.
         """
-        if not deterministic: 
-            stacked_actions, n_tensors, n_envs, time_indices = self._temporal_ensemble_helper(self.past_actions)
+        past_actions = self.past_eval_actions if deterministic else self.past_actions
+        past_valid = self.past_eval_valid if deterministic else self.past_valid
 
-            selected_actions = stacked_actions[
-                th.arange(n_tensors),       # tensor dimension
-                time_indices,               # time_step dimension (reversed)
-                :,                          # all environments
-                :                           # all action dims
-            ]
-            stacked_logs = th.stack(list(self.past_log_probs))
-            selected_logs = stacked_logs[
-                th.arange(n_tensors),       # tensor dimension
-                time_indices,               # time_step dimension (reversed)
-                :                           # all environments
-            ]
-            ### linear weighted mean
-            # return (selected_actions.mean(dim=0), selected_logs.mean(dim=0))
-
-            ### reverse-exponential weighted mean
-            weights = self.exponential_weighting[self.time_horizon - selected_actions.shape[0]:].to(self.device)
-            scaled_selected_actions = selected_actions * weights.reshape(-1, 1, 1)
-            scaled_selected_logs = selected_logs * weights.reshape(-1, 1)
-
-            ### return the actions used to create the temporal ensemble action
-            flattened_selected_actions = selected_actions.transpose(0, 1).flip([1]).reshape(n_envs, -1)
-            if flattened_selected_actions.shape[1] < self.action_dim:
-                zero_padding = th.zeros(n_envs, self.action_dim - flattened_selected_actions.shape[1])
-                flattened_selected_actions = th.cat((flattened_selected_actions, zero_padding.to(flattened_selected_actions.device)), dim=1)
-            return (scaled_selected_actions.sum(dim=0), scaled_selected_logs.sum(dim=0), flattened_selected_actions)
-        else: # only during evaluation
-            stacked_actions, n_tensors, n_envs, time_indices = self._temporal_ensemble_helper(self.past_eval_actions)
-            selected_actions = stacked_actions[
-                th.arange(n_tensors),       # tensor dimension
-                time_indices,               # time_step dimension (reversed)
-                :,                          # all environments
-                :                           # all action dims
-            ]
-            weights = self.exponential_weighting[self.time_horizon - selected_actions.shape[0]:].to(self.device)
-            scaled_selected_actions = selected_actions * weights.reshape(-1, 1, 1)
-            return scaled_selected_actions.sum(dim=0)
-
-    def _temporal_ensemble_helper(self, actions):
-        stacked_actions = th.stack(list(actions))
+        stacked_actions = th.stack(list(past_actions))
         n_tensors, _, n_envs, _ = stacked_actions.shape
-        time_indices = th.arange(n_tensors - 1, -1, -1)
-        return stacked_actions, n_tensors, n_envs, time_indices
+        time_indices = th.arange(n_tensors - 1, -1, -1) # chunk ages, oldest chunk first
+        selected_actions = stacked_actions[
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :,                          # all environments
+            :                           # all action dims
+        ]
+        valid = th.stack(list(past_valid))  # [n_tensors, n_envs]
+
+        ### normalized reverse-exponential weighted mean over the valid chunks
+        weights = self.exponential_weighting.to(valid.device)[time_indices].reshape(-1, 1) * valid
+        weights = weights / weights.sum(dim=0, keepdim=True)
+        ensemble_action = (selected_actions * weights.unsqueeze(-1)).sum(dim=0)
+        if deterministic:
+            return ensemble_action
+
+        stacked_logs = th.stack(list(self.past_log_probs))
+        selected_logs = stacked_logs[
+            th.arange(n_tensors),       # tensor dimension
+            time_indices,               # time_step dimension (reversed)
+            :                           # all environments
+        ]
+        ensemble_log = (selected_logs * weights).sum(dim=0)
+
+        ### return the actions used to create the temporal ensemble action
+        flattened_selected_actions = (selected_actions * valid.unsqueeze(-1)).transpose(0, 1).flip([1]).reshape(n_envs, -1)
+        if flattened_selected_actions.shape[1] < self.action_dim:
+            zero_padding = th.zeros(n_envs, self.action_dim - flattened_selected_actions.shape[1])
+            flattened_selected_actions = th.cat((flattened_selected_actions, zero_padding.to(flattened_selected_actions.device)), dim=1)
+        return ensemble_action, ensemble_log, flattened_selected_actions
 
     def forward_info_bottleneck(self, obs: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -467,17 +456,54 @@ class TemporalActorCriticPolicy(BasePolicy):
         """
         return self.get_distribution(observation).get_actions(deterministic=deterministic)
 
-    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
+    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor, past_obs: Optional[th.Tensor] = None) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Evaluate actions according to the current policy,
         given the observations.
 
+        For temporal ensemble, ``actions`` holds the ensembled actions ordered by chunk age (newest first)
+        and ``past_obs`` holds the states s_{t-H+1}, ..., s_{t-1} (oldest first, flattened over the batch
+        as returned by ``TemporalRolloutBuffer``). The action of age j is
+        evaluated under the chunk sampled at s_{t-j}, i.e., the state that actually produced it.
+
         :param obs: Observation
         :param actions: Actions
+        :param past_obs: Previous observations, required for temporal ensemble
         :return: estimated value, log likelihood of taking those actions
             and entropy of the action distribution.
         """
-        raise NotImplementedError("Subclasses must implement _get_action_dist_from_latent()")
+        if self.abstraction_type == 'temp-ensemble':
+            batch_size = actions.shape[0]
+            # [batch, H, *obs_shape] ordered by age, then evaluate every state on the full ensembled vector
+            past_obs = past_obs.reshape(batch_size, self.time_horizon - 1, *obs.shape[1:]).flip([1]).to(obs.dtype)
+            obs = th.cat((obs.unsqueeze(1), past_obs), dim=1).flatten(0, 1)
+            actions_per_state = actions.repeat_interleave(self.time_horizon, dim=0)
+        else:
+            actions_per_state = actions
+
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        if self.share_features_extractor:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi, actions_per_state)
+        log_prob = distribution.distribution.log_prob(actions_per_state)
+        entropy = distribution.entropy()
+        if self.abstraction_type == 'temp-ensemble':
+            # [batch, state age, chunk index] -> keep chunk index j of the chunk sampled at s_{t-j}
+            log_prob = log_prob.reshape(batch_size, self.time_horizon, self.time_horizon, self.og_action_dim).sum(dim=-1)
+            log_prob = log_prob.diagonal(dim1=1, dim2=2)
+            zero_mask = (actions.reshape(-1, self.time_horizon, self.og_action_dim) != 0).any(dim=-1).float()
+            weights = self.exponential_weighting.to(zero_mask.device) * zero_mask
+            weights = weights / weights.sum(dim=1, keepdim=True)
+            log_prob = (log_prob * weights).sum(dim=1)
+            values = values.reshape(batch_size, self.time_horizon)[:, :1]
+            entropy = entropy.reshape(batch_size, self.time_horizon)[:, 0]
+        return values, log_prob, entropy
 
     def get_distribution(self, obs: PyTorchObs) -> Distribution:
         """
@@ -526,6 +552,8 @@ class ICCTPolicy(TemporalActorCriticPolicy):
                         comparators=None,
                         leaves=self.ddt_kwargs['num_leaves'],
                         alpha=None,
+                        paths=None,
+                        submodels=None,
                         use_individual_alpha=self.ddt_kwargs['use_individual_alpha'],
                         device=self.ddt_kwargs['device'],
                         use_submodels=self.ddt_kwargs['submodels'],
@@ -558,38 +586,6 @@ class ICCTPolicy(TemporalActorCriticPolicy):
             z = th.FloatTensor(mean_actions.shape).uniform_(-self.rpo_alpha, self.rpo_alpha).to(self.device)
             mean_actions = mean_actions + z
         return self.action_dist.proba_distribution(mean_actions, self.log_std)
-
-    def evaluate_actions(self, obs: PyTorchObs, actions: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
-        """
-        Evaluate actions according to the current policy,
-        given the observations.
-
-        :param obs: Observation
-        :param actions: Actions
-        :return: estimated value, log likelihood of taking those actions
-            and entropy of the action distribution.
-        """
-
-        # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        values = self.value_net(latent_vf)
-        distribution = self._get_action_dist_from_latent(latent_pi, actions, morphed)
-        if self.abstraction_type == 'temp-ensemble':
-            # zero_mask = ((actions!=0)[:, ::2]*1.0).to(self.device)
-            actions_reshaped = actions.reshape(-1, self.time_horizon, self.og_action_dim)
-            zero_mask = (actions_reshaped != 0).any(dim=-1).float() 
-            log_prob = distribution.distribution.log_prob(actions).reshape(-1, self.time_horizon, self.og_action_dim).sum(dim=-1)
-            log_prob = (log_prob * zero_mask * self.exponential_weighting.flip([0]).to(self.device)).sum(dim=1)
-        elif self.abstraction_type == 'temp-pred':
-            log_prob = distribution.distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        return values, log_prob, entropy
 
     def forward_info_bottleneck(self, obs: th.Tensor, morphed=False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
