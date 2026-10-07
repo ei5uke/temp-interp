@@ -24,4 +24,5 @@ python -m temp_interp.run.train \
   --submodels \
   --sparse_submodel_type 0 \
   --num_search 1 \
+  --pred_coef 0.005 \
   --gpu \

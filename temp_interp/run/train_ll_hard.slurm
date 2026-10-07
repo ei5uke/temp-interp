@@ -35,5 +35,6 @@ python -m temp_interp.run.train \
   --submodels \
   --sparse_submodel_type 0 \
   --num_search 5 \
+  --pred_coef 0.005 \
   --time_horizon 10 \
   --mlp_policy_size small \

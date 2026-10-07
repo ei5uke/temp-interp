@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=1
 echo "Running MLP with Action Chunking with seed ${SEED} and method ${METHOD}"
 curr_user=$(whoami)
 
-python -m temp_interp.run.train \
+python -m temp_interp.run.train_mlp \
   --env_name lunar \
   --abstraction_type ${METHOD} \
   --num_envs 32 \
@@ -31,6 +31,7 @@ python -m temp_interp.run.train \
   --training_steps 3000000 \
   --log_interval 1 \
   --gpu \
-  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/ \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/ll/${RUN_NAME:-mlp_${SIZE:-mid}_${METHOD}}/ \
   --time_horizon ${TIME} \
-  --mlp_policy_size mid \
+  --mlp_policy_size ${SIZE:-mid} \
+  ${EXTRA_ARGS}

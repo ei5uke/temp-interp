@@ -30,6 +30,6 @@ for SEED in 0 1 2; do
 done
 
 for SEED in 0 1 2; do
-  sbatch --export=ALL,SEED=$SEED,METHOD=temp-ensemble temp_interp/run/train_ll_hard_all.slurm
-  sbatch --export=ALL,SEED=$SEED,METHOD=temp-pred temp_interp/run/train_ll_hard_all.slurm
+  sbatch --export=ALL,SEED=$SEED,METHOD=temp-ensemble,TIME=$time_horizon temp_interp/run/train_ll_hard_all.slurm
+  sbatch --export=ALL,SEED=$SEED,METHOD=temp-pred,TIME=$time_horizon temp_interp/run/train_ll_hard_all.slurm
 done

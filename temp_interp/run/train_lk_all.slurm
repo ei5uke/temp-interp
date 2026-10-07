@@ -31,9 +31,10 @@ python -m temp_interp.run.train \
   --training_steps 1000000 \
   --log_interval 1 \
   --gpu \
-  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/lk/ \
+  --save_path /scratch/gilbreth/${curr_user}/temp-interp/temp_interp/run/logs/lk/${RUN_NAME:-ddt_${METHOD}}/ \
   --use_individual_alpha \
   --hard_node \
   --submodels \
   --sparse_submodel_type 0 \
   --time_horizon ${TIME} \
+  ${EXTRA_ARGS}
