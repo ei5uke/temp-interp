@@ -2,6 +2,7 @@
 # modified to leverage PPO instead of SAC or TD3, directly apply PPO+ICCTs, and PPO+ICCT+action chunking.
 
 import copy
+import json
 import argparse
 import random
 import os
@@ -22,6 +23,8 @@ from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.torch_layers import CombinedExtractor, FlattenExtractor
 from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
+from temp_interp.rl_helpers.evaluation import evaluate_policy_A
+from temp_interp.algos.cart import collect_teacher_data, fit_cart, cart_num_params, cart_to_icct
 import temp_interp.envs.lunar_lander_hard
 
 def make_env(env_id, gamma=None):
@@ -36,6 +39,18 @@ def make_env(env_id, gamma=None):
         env = gym.wrappers.FlattenObservation(env) # change Dict to nparray
         return env
     return thunk
+
+# Per-environment DDT and ITTR settings (Table 5 of the paper). The remaining ITTR keys are passed to PPO.
+ITTR_CONFIGS = {
+    'lane_keeping': dict(num_leaves=2, epsilon=5e-2, min_timesteps=200, min_headstart=2000, min_evaluations=2,
+                         min_visitations=1e5, low_return_stat='mean', low_return_threshold=-0.3, prune_first=False),
+    'cart': dict(num_leaves=2, epsilon=2e-1, min_timesteps=600, min_headstart=6000, min_evaluations=3,
+                 min_visitations=1e5, low_return_stat='mean', low_return_threshold=0.0, prune_first=False),
+    'lunar': dict(num_leaves=2, epsilon=5e-2, min_timesteps=1000, min_headstart=10000, min_evaluations=4,
+                  min_visitations=1e5, low_return_stat='mean', low_return_threshold=0.0, prune_first=False),
+    'lunar-hard': dict(num_leaves=4, epsilon=5e-3, min_timesteps=1000, min_headstart=10000, min_evaluations=4,
+                       min_visitations=1e5, low_return_stat='frac_positive', low_return_threshold=0.5, prune_first=True),
+}
 
 # https://stable-baselines3.readthedocs.io/en/master/guide/examples.html
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -94,9 +109,24 @@ if __name__ == "__main__":
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
     parser.add_argument('--num_search', help='the number of hyperparameter searches', type=int, default=1)
     parser.add_argument('--time_horizon', help='the time horizon of the temporal abstraction', type=int, default=10)
+    parser.add_argument('--no_sweep', help='run once with the first value of each sweep parameter, without a W&B sweep (works offline)', action='store_true', default=False)
+    parser.add_argument('--pred_coef', help='scaling coefficient lambda of the temporal prediction objective', type=float, default=1.0)
+    # CART distillation and warm start
+    parser.add_argument('--cart_teacher', help='path of a trained (MLP-Big) model to distill into a CART tree', type=str, default=None)
+    parser.add_argument('--cart_samples', help='number of teacher state / action pairs used to fit CART', type=int, default=100000)
+    parser.add_argument('--cart_max_leaves', help='maximum number of CART leaves (default: the starting number of DDT leaves)', type=int, default=None)
+    parser.add_argument('--cart_eval_episodes', help='number of episodes used to evaluate the CART tree', type=int, default=100)
+    parser.add_argument('--warm_start', help='after distillation, train the CART tree with RL as a DDT', action='store_true', default=False)
+    # ITTR overrides of the per-environment presets in ITTR_CONFIGS
+    parser.add_argument('--decay', help='EMA coefficient of temporal ensemble (default: the sweep value)', type=float, default=None)
+    parser.add_argument('--epsilon', help='ITTR: minimum average policy complexity gradient', type=float, default=None)
+    parser.add_argument('--min_timesteps', help='ITTR: minimum steps since the last restructuring (n)', type=int, default=None)
+    parser.add_argument('--min_headstart', help='ITTR: minimum global steps before restructuring (m)', type=int, default=None)
+    parser.add_argument('--min_visitations', help='ITTR: prune a leaf visited fewer than k times (k)', type=float, default=None)
 
     args = parser.parse_args()
     assert args.abstraction_type is not None, print("ERROR: Abstraction type not set.")
+    assert not args.warm_start or args.cart_teacher is not None, "--warm_start requires --cart_teacher"
     set_random_seed(args.seed) # can add: using_cuda=True
     if args.env_name == 'lunar': env_id = 'LunarLanderContinuous-v3'
     elif args.env_name == 'lunar-hard': env_id = 'LunarLanderHard'
@@ -108,30 +138,21 @@ if __name__ == "__main__":
     eval_env = make_env(env_id)()
     eval_env.reset(seed=args.seed)
 
+    ittr_kwargs = dict(ITTR_CONFIGS[args.env_name])
+    num_leaves, epsilon = ittr_kwargs.pop('num_leaves'), ittr_kwargs.pop('epsilon')
+    if args.epsilon is not None: epsilon = args.epsilon
+    for key in ['min_timesteps', 'min_headstart', 'min_visitations']:
+        if getattr(args, key) is not None: ittr_kwargs[key] = getattr(args, key)
+
     sweep_config = {
         'method': 'bayes',
         'parameters': {
-            # 'ddt_lr': {
-            #     'distribution': 'uniform',
-            #     'min': 1e-4,
-            #     'max': 9e-4
-            # },
             'ddt_lr': {
                 'values': [5e-4]
             },
-            # 'lr': {
-            #     'distribution': 'uniform',
-            #     'min': 1e-4,
-            #     'max': 9e-4
-            # },
             'lr': {
                 'values': [5e-4]
             },
-            # 'clip_range': {
-            #     'distribution': 'uniform',
-            #     'min': 0.1,
-            #     'max': 0.3
-            # },
             'clip_range': {
                 'values': [0.2]
             },
@@ -139,22 +160,17 @@ if __name__ == "__main__":
                 'values': [args.time_horizon]
             },
             'num_leaves': {
-                'values': [8]
+                'values': [num_leaves]
             },
-            # 'epsilon': {
-            #     'distribution': 'log_uniform_values',
-            #     'min': 1e-3,
-            #     'max': 0.5,
-            # }
             'epsilon': {
-                'values': [2e-2]
+                'values': [epsilon]
             },
         }
     }
     if args.abstraction_type == 'temp-ensemble':
         sweep_config['metric'] = {'name': 'eval/mean_reward', 'goal': 'maximize'}
         # sweep_config['parameters']['decay'] = {'distribution': 'uniform', 'min': 0.5, 'max': 1.0}
-        sweep_config['parameters']['decay'] = {'values': [0.75]}
+        sweep_config['parameters']['decay'] = {'values': [0.75 if args.decay is None else args.decay]}
     elif args.abstraction_type == 'temp-pred':
         sweep_config['metric'] = {'name': 'eval/mean_total', 'goal': 'maximize'}
         # sweep_config['parameters']['curriculum_coef'] = {'distribution': 'uniform', 'min': 0.1, 'max': 1.0}
@@ -163,7 +179,11 @@ if __name__ == "__main__":
     def train():
         ## wandb setup
         run_name = f"{env_id}__{args.seed}__ICCT_{args.time_horizon}_{int(time.time())}"
-        run = wandb.init(name=run_name, sync_tensorboard=True)
+        if args.no_sweep:
+            run = wandb.init(project=args.abstraction_type+"ICCT", name=run_name, sync_tensorboard=True,
+                             config={k: v['values'][0] for k, v in sweep_config['parameters'].items()})
+        else:
+            run = wandb.init(name=run_name, sync_tensorboard=True)
         config = wandb.config
 
         log_dir = args.save_path
@@ -193,7 +213,7 @@ if __name__ == "__main__":
         wandb_callback = WandbCallback(model_save_freq=args.eval_freq, model_save_path=log_dir, verbose=2)
         callback = CallbackList([callback, wandb_callback])
 
-        if args.gpu:
+        if args.gpu and th.cuda.is_available():
             args.device = 'cuda'
         else:
             args.device = 'cpu'
@@ -249,9 +269,35 @@ if __name__ == "__main__":
                     device=args.device,
                     curriculum_coef=0 if args.abstraction_type == 'temp-ensemble' else config.curriculum_coef,
                     seed=args.seed,
-                    epsilon=config.epsilon)
+                    epsilon=config.epsilon,
+                    pred_coef=args.pred_coef,
+                    ittr_kwargs=ittr_kwargs)
+
+        if args.cart_teacher is not None:
+            # CART: distill the teacher into a tree with linear leaves and evaluate it as an ICCT
+            teacher = PPO.load(args.cart_teacher, env=envs, device=args.device)
+            assert teacher.policy.abstraction_type == args.abstraction_type and teacher.policy.action_dim == model.policy.action_dim, \
+                "The teacher must use the same abstraction type and time horizon"
+            teacher_env = make_vec_env(make_env(env_id), n_envs=1, seed=args.seed)
+            states, targets = collect_teacher_data(teacher, teacher_env, args.cart_samples)
+            cart, leaf_models = fit_cart(states, targets, args.cart_max_leaves or num_leaves, args.seed)
+            model.set_action_net(cart_to_icct(cart, leaf_models, model.policy.action_net))
+            rewards, _, _ = evaluate_policy_A(model, monitor_eval_env, n_eval_episodes=args.cart_eval_episodes, return_episode_rewards=True)
+            cart_results = {'cart/mean_reward': float(np.mean(rewards)), 'cart/std_reward': float(np.std(rewards)),
+                            'cart/num_leaves': int(cart.get_n_leaves()), 'cart/num_params': int(cart_num_params(cart, model.policy.action_dim))}
+            wandb.log(cart_results)
+            with open(log_dir + f'cart_results_seed{args.seed}.json', 'w') as f:
+                json.dump(cart_results, f)
+            model.save(log_dir + f'cart_seed{args.seed}')
+            if not args.warm_start:
+                run.finish()
+                return
+
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
 
-    sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type+"ICCT")
-    wandb.agent(sweep_id, function=train, count=args.num_search)
+    if args.no_sweep:
+        train()
+    else:
+        sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type+"ICCT")
+        wandb.agent(sweep_id, function=train, count=args.num_search)

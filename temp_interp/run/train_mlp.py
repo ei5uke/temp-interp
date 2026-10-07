@@ -23,12 +23,6 @@ from stable_baselines3.common.torch_layers import CombinedExtractor, FlattenExtr
 from temp_interp.rl_helpers.save_after_ep_callback import EpCheckPointCallback
 from temp_interp.rl_helpers.ppo import PPO
 import temp_interp.envs.lunar_lander_hard
-#### might have issues b/c hpc isn't ubuntu, figure out later
-# from flow.utils.registry import make_create_env
-# from temp_interp.envs.accel_ring import ring_accel_params
-# from temp_interp.envs.accel_ring_multilane import ring_accel_lc_params
-# from temp_interp.envs.accel_figure8 import fig8_params
-####
 
 def make_env(env_id, gamma=None):
     def thunk():
@@ -86,6 +80,8 @@ if __name__ == "__main__":
     parser.add_argument('--log_interval', help='the number of episodes before logging', type=int, default=4)
     parser.add_argument('--use_wandb', help='whether to log using wandb instead of raw tensorboard', type=bool, default=True)
     parser.add_argument('--time_horizon', help='the time horizon of the temporal abstraction', type=int, default=10)
+    parser.add_argument('--no_sweep', help='run once with the first value of each sweep parameter, without a W&B sweep (works offline)', action='store_true', default=False)
+    parser.add_argument('--pred_coef', help='scaling coefficient lambda of the temporal prediction objective', type=float, default=1.0)
     parser.add_argument('--mlp_policy_size', help='the size of the MLP policy: small, mid, max', type=str, default='mid')
     parser.add_argument('--num_search', help='number of hyperparameter search trials', type=int, default=1)
 
@@ -132,7 +128,9 @@ if __name__ == "__main__":
         action_net_arch = [hidden_dim, hidden_dim]
         run_name = f"{env_id}__{args.seed}__MLPPolicy_{args.time_horizon}_{'_'.join(map(str, action_net_arch))}_{int(time.time())}"
         
-        run = wandb.init(project=args.abstraction_type + 'mlp', name=run_name, config=vars(args), sync_tensorboard=True)
+        config = vars(args)
+        if args.no_sweep: config = {**config, **{k: v['values'][0] for k, v in sweep_config['parameters'].items()}}
+        run = wandb.init(project=args.abstraction_type + 'mlp', name=run_name, config=config, sync_tensorboard=True)
         config = wandb.config
 
         log_dir = args.save_path
@@ -146,7 +144,7 @@ if __name__ == "__main__":
         wandb_callback = WandbCallback(model_save_freq=args.eval_freq, model_save_path=log_dir, verbose=2)
         callback = CallbackList([callback, wandb_callback])
 
-        if args.gpu:
+        if args.gpu and th.cuda.is_available():
             args.device = 'cuda'
         else:
             args.device = 'cpu'
@@ -189,7 +187,8 @@ if __name__ == "__main__":
                     verbose=1,
                     device=args.device,
                     curriculum_coef=0 if args.abstraction_type == 'temp-ensemble' else config.curriculum_coef,
-                    seed=args.seed)
+                    seed=args.seed,
+                    pred_coef=args.pred_coef)
 
         print(f"Policy Architecture:\n{model.policy}")
         
@@ -204,5 +203,8 @@ if __name__ == "__main__":
         model.learn(total_timesteps=args.training_steps, log_interval=args.log_interval, callback=callback)
         run.finish()
     
-    sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type + 'mlp')
-    wandb.agent(sweep_id, function=train, count=args.num_search)
+    if args.no_sweep:
+        train()
+    else:
+        sweep_id = wandb.sweep(sweep_config, project=args.abstraction_type + 'mlp')
+        wandb.agent(sweep_id, function=train, count=args.num_search)
