@@ -1,3 +1,6 @@
+import argparse
+from pathlib import Path
+
 import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -61,18 +64,33 @@ def read_and_process_wandb_csv(filepath, value_column_name='Value'):
         print(f"Error processing {filepath}: {e}")
         return None, None
 
-def plot_experiment(experiment_name, csv_files, ax, color):
+def read_tensorboard_leaves(run_dir: Path):
     """
-    Aggregates data from multiple CSVs (seeds) and plots mean +/- std dev.
+    Reads ``train/num_leaves`` from the tensorboard logs of a local run (see temp_interp/run/run_local.py).
+    """
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    for events in run_dir.rglob('events.out.tfevents.*'):
+        if 'wandb' in events.parts:
+            continue
+        acc = EventAccumulator(str(events), size_guidance={'scalars': 0})
+        acc.Reload()
+        if 'train/num_leaves' in acc.Tags()['scalars']:
+            scalars = acc.Scalars('train/num_leaves')
+            return np.array([e.step for e in scalars]), smooth(np.array([e.value for e in scalars]), SMOOTHING_WEIGHT)
+    print(f"No train/num_leaves found in {run_dir}")
+    return None, None
+
+def plot_experiment(experiment_name, runs, ax, color, linestyle='-'):
+    """
+    Aggregates the (steps, values) of multiple seeds and plots mean +/- s.e.
     """
     all_values = []
     common_steps = None
 
     # Load data from all seeds
-    for f in csv_files:
-        steps, vals = read_and_process_wandb_csv(f)
+    for steps, vals in runs:
         if steps is not None:
-            # For simplicity, we assume all CSVs have roughly the same steps.
+            # For simplicity, we assume all runs have roughly the same steps.
             # If lengths differ slightly, we trim to the shortest run.
             if common_steps is None or len(steps) < len(common_steps):
                 common_steps = steps
@@ -81,56 +99,68 @@ def plot_experiment(experiment_name, csv_files, ax, color):
     # Trim all runs to the length of the shortest run to align them
     min_len = len(common_steps)
     all_values = [v[:min_len] for v in all_values]
-    
+
     # Convert to numpy array for easy math (rows=seeds, cols=steps)
     data_array = np.array(all_values)
-    
+
     # Calculate Mean and Se Dev
     mean_curve = np.mean(data_array, axis=0)
-    se_curve = np.std(data_array, axis=0) / np.sqrt(3) # b/c we use 3 seeds
-    
+    se_curve = np.std(data_array, axis=0) / np.sqrt(len(all_values))
+
     # Plot Mean
-    ax.plot(common_steps, mean_curve, label=experiment_name, color=color, linewidth=2)
-    
+    ax.plot(common_steps, mean_curve, label=experiment_name, color=color, linewidth=2, linestyle=linestyle)
+
     # Plot Shaded Se Dev
-    ax.fill_between(common_steps, 
-                    mean_curve - se_curve, 
-                    mean_curve + se_curve, 
+    ax.fill_between(common_steps,
+                    mean_curve - se_curve,
+                    mean_curve + se_curve,
                     color=color, alpha=0.2)
+
+def plot_figure(title, experiments, filename, colors, linestyles=None):
+    """
+    One panel of Figure 2: a curve (mean +/- s.e. over seeds) per experiment.
+
+    :param experiments: dict of curve name -> list of (steps, values), one per seed
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, (name, runs) in enumerate(experiments.items()):
+        plot_experiment(name, runs, ax, colors[i], linestyles[i] if linestyles else '-')
+
+    ax.set_ylim(1.9, 4.1)  # same range on every panel
+    ax.set_title(title, fontsize=28, pad=15, fontweight='bold')
+    ax.set_xlabel("Time Steps", fontsize=28, fontweight='bold')
+    ax.set_ylabel("Number of leaves", fontsize=28, fontweight='bold')
+    ax.tick_params(axis='both', which='major', labelsize=24)
+    ax.xaxis.get_offset_text().set_fontsize(22)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fancybox=True, shadow=True, frameon=True, ncol=4, fontsize=22)
+
+    plt.tight_layout()
+    plt.savefig(f"{filename}.pdf")
+    plt.savefig(f"{filename}.png")
+    plt.close(fig)
 
 # --- Main Execution ---
 
-# fullenvs = ['Inverted Pendulum v5', 'Lane Keeping', 'Lunar Lander v3', 'Lunar Lander v3 Hard']
-algos = ["temp-ensemble", "temp-pred"]
-# algos = ["NoAC"]
-titles = ["DDT-Ensemble", "DDT-Prediction"]
-# titles = ["DDT"]
-idx = 1
-algo = algos[idx]
-experiments = {
-    "LK": [f"leaves_results_{algo}/ddt_lk_seed0.csv", f"leaves_results_{algo}/ddt_lk_seed1.csv", f"leaves_results_{algo}/ddt_lk_seed2.csv"],
-    "IP": [f"leaves_results_{algo}/ddt_ip_seed0.csv", f"leaves_results_{algo}/ddt_ip_seed1.csv", f"leaves_results_{algo}/ddt_ip_seed2.csv"],
-    "LL": [f"leaves_results_{algo}/ddt_ll_seed0.csv", f"leaves_results_{algo}/ddt_ll_seed1.csv", f"leaves_results_{algo}/ddt_ll_seed2.csv"],
-    "LL-H": [f"leaves_results_{algo}/ddt_ll-h_seed0.csv", f"leaves_results_{algo}/ddt_ll-h_seed1.csv", f"leaves_results_{algo}/ddt_ll-h_seed2.csv"],
-}
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Plot the number of leaves during training (Figure 2)')
+    parser.add_argument('--root', type=Path, default=Path('results'), help='output directory of temp_interp/run/run_local.py')
+    parser.add_argument('--out', type=Path, default=Path('.'), help='directory to save the plots in')
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
 
-fig, ax = plt.subplots(figsize=(10, 6))
+    envs = {"LK": "lk", "IP": "ip", "LL": "ll", "LL-H": "ll_hard"}
+    seeds = [0, 1, 2]
+    colors = sns.color_palette("deep", n_colors=len(envs))
 
-colors = sns.color_palette("deep", n_colors=len(experiments))
+    def runs(env, run_name):
+        return [read_tensorboard_leaves(args.root / env / run_name / f"seed{seed}") for seed in seeds]
 
-for i, (name, files) in enumerate(experiments.items()):
-    plot_experiment(name, files, ax, colors[i])
+    # (a), (b): DDTs trained from scratch in every domain
+    for algo, title in [("temp-ensemble", "DDT-Ensemble"), ("temp-pred", "DDT-Prediction")]:
+        plot_figure(title, {name: runs(env, f"ddt_{algo}") for name, env in envs.items()}, args.out / f"leaves_plots_{algo}", colors)
 
-ax.set_title(titles[idx], fontsize=28, pad=15, fontweight='bold')
-ax.set_xlabel("Time Steps", fontsize=28, fontweight='bold')
-ax.set_ylabel("Number of leaves", fontsize=28, fontweight='bold')
-ax.legend(loc="lower left", frameon=True, fontsize=22)
-ax.tick_params(axis='both', which='major', labelsize=24)
-ax.xaxis.get_offset_text().set_fontsize(22)
-ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fancybox=True, shadow=True, frameon=True, ncol=4, fontsize=22)
-
-plt.tight_layout()
-plt.savefig(f"leaves_plots_{algo}.pdf")
-plt.savefig(f"leaves_plots_{algo}.png")
-plt.show()
+    # (c): warm-started DDTs in LL-H, the only domain where ITTR restructures them
+    plot_figure("Warm (LL-H)", {"Warm-Ensemble": runs("ll_hard", "warmcompact_temp-ensemble"),
+                                "Warm-Prediction": runs("ll_hard", "warmcompact_temp-pred")},
+                args.out / "leaves_plots_warm", colors, linestyles=['-', '--'])
